@@ -1,0 +1,6 @@
+# AmethystFlame_BN 双向网格交易策略 v1.0
+# 运行双向策略所需的Python依赖包
+
+ccxt>=4.0.0
+websockets>=11.0.0
+python-dotenv>=1.0.0

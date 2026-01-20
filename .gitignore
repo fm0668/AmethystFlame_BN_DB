@@ -1,0 +1,15 @@
+.env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+*.pyc
+log/
+status/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+网格面板(UI) 参数说明.md
+项目设计书_单边网格.md
+
