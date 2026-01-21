@@ -14,14 +14,6 @@ class RiskEngine:
         self._config_version = 0
         self._last_config_error_ts = 0.0
         self._last_config_error_sig = None
-        self._last_long_stage = 0
-        self._last_short_stage = 0
-        self._last_long_stage_change_ts = 0.0
-        self._last_short_stage_change_ts = 0.0
-        self._stage1_down_confirm = 0
-        self._stage2_down_confirm = 0
-        self._stage1_up_confirm = 0
-        self._stage2_up_confirm = 0
 
     def get_config(self) -> dict:
         cfg = self._config
@@ -38,26 +30,11 @@ class RiskEngine:
             "BASE_POSITION_USDC": 0.0,
             "BASE_GRID_SPACING": 0.0025,
             "BASE_ORDER_SIZE_USDC": 40.0,
-            "STAGE1_THRESHOLD_USDC": 400.0,
-            "STAGE1_EXIT_USDC": 380.0,
-            "STAGE1_TP_SPACING": 0.0012,
-            "STAGE1_TP_SIZE_USDC": 80.0,
-            "STAGE2_THRESHOLD_USDC": 600.0,
-            "STAGE2_EXIT_USDC": 560.0,
-            "STAGE2_ADD_SPACING": 0.0050,
-            "STAGE2_ADD_SIZE_USDC": 25.0,
-            "STAGE2_OPP_TP_SIZE_USDC": 0.0,
-            "STAGE2_OPP_ADD_SIZE_USDC": 0.0,
             "REST_SYNC_INTERVAL_SEC": 10.0,
             "ORDER_FIRST_TIME_SEC": 10.0,
             "GRID_ACTION_COOLDOWN_SEC": 1.2,
             "STATUS_LOG_INTERVAL_SEC": 60.0,
             "RISK_EVAL_MIN_INTERVAL_SEC": 0.8,
-            "STAGE_SWITCH_COOLDOWN_SEC": 15.0,
-            "STAGE_SWITCH_CONFIRM_COUNT": 2,
-            "HARD_STOPLOSS_PNL_USDC": 20.0,
-            "HARD_STOPLOSS_CONFIRM_COUNT": 2,
-            "HARD_STOPLOSS_CHECK_INTERVAL_SEC": 1.0,
             "STOP_ON_HARDSTOP": True,
             "HARD_STOPLOSS_PRICE": 0.0,
             "TAKE_PROFIT_ENABLED": False,
@@ -87,33 +64,11 @@ class RiskEngine:
             "基础网格间距": "BASE_GRID_SPACING",
             "基础下单金额USDC": "BASE_ORDER_SIZE_USDC",
             "基础下单金额USDT": "BASE_ORDER_SIZE_USDC",
-            "阶段1阈值USDC": "STAGE1_THRESHOLD_USDC",
-            "阶段1阈值USDT": "STAGE1_THRESHOLD_USDC",
-            "阶段1退出阈值USDC": "STAGE1_EXIT_USDC",
-            "阶段1退出阈值USDT": "STAGE1_EXIT_USDC",
-            "阶段1止盈间距": "STAGE1_TP_SPACING",
-            "阶段1止盈金额USDC": "STAGE1_TP_SIZE_USDC",
-            "阶段1止盈金额USDT": "STAGE1_TP_SIZE_USDC",
-            "阶段2阈值USDC": "STAGE2_THRESHOLD_USDC",
-            "阶段2阈值USDT": "STAGE2_THRESHOLD_USDC",
-            "阶段2退出阈值USDC": "STAGE2_EXIT_USDC",
-            "阶段2退出阈值USDT": "STAGE2_EXIT_USDC",
-            "阶段2补仓间距": "STAGE2_ADD_SPACING",
-            "阶段2补仓金额USDC": "STAGE2_ADD_SIZE_USDC",
-            "阶段2补仓金额USDT": "STAGE2_ADD_SIZE_USDC",
-            "阶段2对手方止盈金额USDC": "STAGE2_OPP_TP_SIZE_USDC",
-            "阶段2对手方补仓金额USDC": "STAGE2_OPP_ADD_SIZE_USDC",
             "状态同步间隔秒": "REST_SYNC_INTERVAL_SEC",
             "首次下单等待秒": "ORDER_FIRST_TIME_SEC",
             "最小重挂间隔秒": "GRID_ACTION_COOLDOWN_SEC",
             "状态日志间隔秒": "STATUS_LOG_INTERVAL_SEC",
             "风控最小评估间隔秒": "RISK_EVAL_MIN_INTERVAL_SEC",
-            "阶段切换冷却秒": "STAGE_SWITCH_COOLDOWN_SEC",
-            "阶段切换确认次数": "STAGE_SWITCH_CONFIRM_COUNT",
-            "单边浮亏硬止损USDC": "HARD_STOPLOSS_PNL_USDC",
-            "单边浮亏硬止损USDT": "HARD_STOPLOSS_PNL_USDC",
-            "硬止损确认次数": "HARD_STOPLOSS_CONFIRM_COUNT",
-            "硬止损检查间隔秒": "HARD_STOPLOSS_CHECK_INTERVAL_SEC",
             "硬止损后停止策略": "STOP_ON_HARDSTOP",
             "硬止损价格": "HARD_STOPLOSS_PRICE",
             "止盈启用": "TAKE_PROFIT_ENABLED",
@@ -239,26 +194,10 @@ class RiskEngine:
 
         base_spacing = float(cfg.get("BASE_GRID_SPACING", 0.0025))
         base_size = float(cfg.get("BASE_ORDER_SIZE_USDC", 40.0))
-        s1 = float(cfg.get("STAGE1_THRESHOLD_USDC", 400.0))
-        s2 = float(cfg.get("STAGE2_THRESHOLD_USDC", 600.0))
-        s1_exit = float(cfg.get("STAGE1_EXIT_USDC", max(0.0, s1 * 0.95)))
-        s2_exit = float(cfg.get("STAGE2_EXIT_USDC", max(0.0, s2 * 0.93)))
-        opp_tp = float(cfg.get("STAGE2_OPP_TP_SIZE_USDC", 0.0))
-        opp_add = float(cfg.get("STAGE2_OPP_ADD_SIZE_USDC", 0.0))
         if base_spacing <= 0:
             raise ValueError("BASE_GRID_SPACING must be > 0")
         if base_size <= 0:
             raise ValueError("BASE_ORDER_SIZE_USDC must be > 0")
-        if s1 <= 0 or s2 <= 0 or s2 <= s1:
-            raise ValueError("STAGE thresholds invalid")
-        if not (0 <= s1_exit < s1):
-            raise ValueError("STAGE1_EXIT_USDC must be < STAGE1_THRESHOLD_USDC")
-        if not (0 <= s2_exit < s2):
-            raise ValueError("STAGE2_EXIT_USDC must be < STAGE2_THRESHOLD_USDC")
-        if opp_tp < 0:
-            raise ValueError("STAGE2_OPP_TP_SIZE_USDC must be >= 0")
-        if opp_add < 0:
-            raise ValueError("STAGE2_OPP_ADD_SIZE_USDC must be >= 0")
 
         rest_sync = float(cfg.get("REST_SYNC_INTERVAL_SEC", 10.0))
         if rest_sync <= 0:
@@ -414,99 +353,15 @@ class RiskEngine:
                     log.error(f"策略配置热更新失败: {e}")
             await asyncio.sleep(float(self.get_config().get("CONFIG_WATCH_INTERVAL_SEC", 1.0)))
 
-    def _client_id(self, side: str, role: str, stage: int, add_spacing: float, add_usdc: float, tp_spacing: float, tp_usdc: float) -> str:
+    def _client_id(self, side: str, role: str, add_spacing: float, add_usdc: float, tp_spacing: float, tp_usdc: float) -> str:
         prefix = str(self.get_config().get("ORDER_CLIENT_ID_PREFIX", "AF")).strip() or "AF"
         s = str(side or "").strip().lower()
         r = str(role or "").strip().lower()
-        base = f"{self._config_version}|{s}|{r}|{int(stage)}|{add_spacing:.8f}|{add_usdc:.4f}|{tp_spacing:.8f}|{tp_usdc:.4f}"
+        base = f"{self._config_version}|{s}|{r}|{add_spacing:.8f}|{add_usdc:.4f}|{tp_spacing:.8f}|{tp_usdc:.4f}"
         digest = hashlib.md5(base.encode("utf-8")).hexdigest()[:12]
         side_ch = "L" if s == "long" else "S"
         role_ch = "A" if r == "add" else "T"
-        return f"{prefix}{side_ch}{role_ch}{int(stage)}{digest}"
-
-    def _compute_stage(self, side: str, notional_usdc: float) -> int:
-        cfg = self.get_config()
-        now = time.time()
-
-        s = str(side or "").strip().lower()
-        if s == "long":
-            last_stage = int(self._last_long_stage)
-            last_change = float(self._last_long_stage_change_ts or 0.0)
-        else:
-            last_stage = int(self._last_short_stage)
-            last_change = float(self._last_short_stage_change_ts or 0.0)
-
-        s1 = float(cfg.get("STAGE1_THRESHOLD_USDC", 400.0))
-        s2 = float(cfg.get("STAGE2_THRESHOLD_USDC", 600.0))
-        s1_exit = float(cfg.get("STAGE1_EXIT_USDC", max(0.0, s1 * 0.95)))
-        s2_exit = float(cfg.get("STAGE2_EXIT_USDC", max(0.0, s2 * 0.93)))
-        cooldown = float(cfg.get("STAGE_SWITCH_COOLDOWN_SEC", 15.0))
-        confirm = max(1, int(cfg.get("STAGE_SWITCH_CONFIRM_COUNT", 2)))
-
-        target = 0
-        if notional_usdc >= s2:
-            target = 2
-        elif notional_usdc >= s1:
-            target = 1
-        else:
-            target = 0
-
-        if last_stage == 2 and notional_usdc < s2_exit:
-            target = 1 if notional_usdc >= s1 else 0
-        if last_stage == 1 and notional_usdc < s1_exit:
-            target = 0
-
-        if target != last_stage and cooldown > 0 and (now - last_change) < cooldown:
-            return last_stage
-
-        if s == "long":
-            if target == 0 and last_stage == 1:
-                self._stage1_down_confirm += 1
-                if self._stage1_down_confirm < confirm:
-                    return last_stage
-            elif target == 1 and last_stage == 0:
-                self._stage1_up_confirm += 1
-                if self._stage1_up_confirm < confirm:
-                    return last_stage
-            elif target == 1 and last_stage == 2:
-                self._stage2_down_confirm += 1
-                if self._stage2_down_confirm < confirm:
-                    return last_stage
-            elif target == 2 and last_stage in {0, 1}:
-                self._stage2_up_confirm += 1
-                if self._stage2_up_confirm < confirm:
-                    return last_stage
-        else:
-            if target == 0 and last_stage == 1:
-                self._stage1_down_confirm += 1
-                if self._stage1_down_confirm < confirm:
-                    return last_stage
-            elif target == 1 and last_stage == 0:
-                self._stage1_up_confirm += 1
-                if self._stage1_up_confirm < confirm:
-                    return last_stage
-            elif target == 1 and last_stage == 2:
-                self._stage2_down_confirm += 1
-                if self._stage2_down_confirm < confirm:
-                    return last_stage
-            elif target == 2 and last_stage in {0, 1}:
-                self._stage2_up_confirm += 1
-                if self._stage2_up_confirm < confirm:
-                    return last_stage
-
-        if target != last_stage:
-            self._stage1_down_confirm = 0
-            self._stage2_down_confirm = 0
-            self._stage1_up_confirm = 0
-            self._stage2_up_confirm = 0
-
-        if s == "long":
-            self._last_long_stage = int(target)
-            self._last_long_stage_change_ts = now
-        else:
-            self._last_short_stage = int(target)
-            self._last_short_stage_change_ts = now
-        return int(target)
+        return f"{prefix}{side_ch}{role_ch}{digest}"
 
     def side_plan(self, side: str, price: float, position_amount: float) -> dict:
         cfg = self.get_config()
@@ -515,22 +370,12 @@ class RiskEngine:
         if p <= 0:
             return {"enabled": False}
 
-        notional = max(0.0, pos * p)
-        stage = self._compute_stage(side, notional)
-
         base_spacing = float(cfg.get("BASE_GRID_SPACING", 0.0025))
         base_usdc = float(cfg.get("BASE_ORDER_SIZE_USDC", 40.0))
         tp_spacing = base_spacing
         tp_usdc = base_usdc
         add_spacing = base_spacing
         add_usdc = base_usdc
-
-        if stage >= 1:
-            tp_spacing = float(cfg.get("STAGE1_TP_SPACING", 0.0012))
-            tp_usdc = float(cfg.get("STAGE1_TP_SIZE_USDC", base_usdc))
-        if stage >= 2:
-            add_spacing = float(cfg.get("STAGE2_ADD_SPACING", base_spacing))
-            add_usdc = float(cfg.get("STAGE2_ADD_SIZE_USDC", base_usdc))
 
         s = str(side or "").strip().lower()
         if s == "long":
@@ -551,20 +396,19 @@ class RiskEngine:
         return {
             "enabled": True,
             "side": s,
-            "stage": int(stage),
-            "notional_usdc": float(notional),
+            "notional_usdc": float(max(0.0, pos * p)),
             "add": {
                 "price": float(add_price),
                 "qty": add_qty,
                 "spacing": float(add_spacing),
                 "size_usdc": float(add_usdc),
-                "client_id": self._client_id(s, "add", stage, add_spacing, add_usdc, tp_spacing, tp_usdc),
+                "client_id": self._client_id(s, "add", add_spacing, add_usdc, tp_spacing, tp_usdc),
             },
             "tp": {
                 "price": float(tp_price),
                 "qty": tp_qty,
                 "spacing": float(tp_spacing),
                 "size_usdc": float(tp_usdc),
-                "client_id": self._client_id(s, "tp", stage, add_spacing, add_usdc, tp_spacing, tp_usdc),
+                "client_id": self._client_id(s, "tp", add_spacing, add_usdc, tp_spacing, tp_usdc),
             },
         }

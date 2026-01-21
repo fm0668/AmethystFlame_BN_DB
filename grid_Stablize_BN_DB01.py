@@ -273,9 +273,6 @@ class GridTradingBot:
 
         self.is_grid_stopped = False
         self._last_risk_eval_ts = 0.0
-        self._last_hardstop_check_ts = 0.0
-        self._hardstop_long_breach_count = 0
-        self._hardstop_short_breach_count = 0
         self._hedge_task = None
         self._stop_order_id = None
         self._last_stop_update_ts = 0.0
@@ -1622,18 +1619,11 @@ class GridTradingBot:
 
         cfg = self.risk_engine.get_config()
         self._apply_runtime_settings_from_config()
-        threshold = self._safe_float(cfg.get("HARD_STOPLOSS_PNL_USDC", 0.0))
         hs_price = self._safe_float(cfg.get("HARD_STOPLOSS_PRICE", 0.0))
-        if (threshold is None or threshold <= 0) and (hs_price is None or hs_price <= 0):
+        if hs_price is None or hs_price <= 0:
             return
-
-        now = time.time()
-        interval = float(cfg.get("HARD_STOPLOSS_CHECK_INTERVAL_SEC", 1.0))
-        if interval > 0 and (now - float(getattr(self, "_last_hardstop_check_ts", 0.0) or 0.0)) < interval:
+        if float(self.latest_price or 0.0) <= 0:
             return
-        self._last_hardstop_check_ts = now
-
-        confirm = max(1, int(cfg.get("HARD_STOPLOSS_CONFIRM_COUNT", 2)))
 
         transient_types = (
             getattr(ccxt, "NetworkError", Exception),
@@ -1672,26 +1662,18 @@ class GridTradingBot:
             amt = float(short_amt or 0.0)
             pnl = None if short_pnl is None else float(short_pnl)
 
+        if amt <= 0:
+            return
+
         breached = False
         reason = None
-        if amt > 0 and threshold is not None and threshold > 0 and pnl is not None and float(pnl) <= -float(threshold):
+        if active == "long" and float(self.latest_price) <= float(hs_price):
             breached = True
-            reason = f"unrealized_pnl={pnl:.6f}<=-{float(threshold):.6f}"
-        if amt > 0 and hs_price is not None and hs_price > 0 and float(self.latest_price or 0.0) > 0:
-            if active == "long" and float(self.latest_price) <= float(hs_price):
-                breached = True
-                reason = f"price={float(self.latest_price):.6f}<=stop_price={float(hs_price):.6f}"
-            if active == "short" and float(self.latest_price) >= float(hs_price):
-                breached = True
-                reason = f"price={float(self.latest_price):.6f}>=stop_price={float(hs_price):.6f}"
-
-        if active == "long":
-            self._hardstop_long_breach_count = (self._hardstop_long_breach_count + 1) if breached else 0
-            cnt = self._hardstop_long_breach_count
-        else:
-            self._hardstop_short_breach_count = (self._hardstop_short_breach_count + 1) if breached else 0
-            cnt = self._hardstop_short_breach_count
-        if not breached or cnt < confirm:
+            reason = f"price={float(self.latest_price):.6f}<=stop_price={float(hs_price):.6f}"
+        if active == "short" and float(self.latest_price) >= float(hs_price):
+            breached = True
+            reason = f"price={float(self.latest_price):.6f}>=stop_price={float(hs_price):.6f}"
+        if not breached:
             return
 
         await self._trigger_hardstop(active, float(pnl or 0.0), str(reason or ""))
