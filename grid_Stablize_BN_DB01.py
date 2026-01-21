@@ -47,13 +47,36 @@ _log_dir = os.path.join(_script_dir, "log")
 os.makedirs(_log_dir, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
+    format="%(asctime)s - %(levelname)s - [%(instance_id)s] - %(message)s",
     handlers=[
-        logging.FileHandler(os.path.join(_log_dir, f"{script_name}.log")),  # 日志文件
+        logging.FileHandler(
+            os.path.join(
+                _log_dir,
+                f"{script_name}_{str(os.getenv('INSTANCE_ID') or '').strip() or 'main'}.log",
+            )
+        ),  # 日志文件
         logging.StreamHandler(),  # 控制台输出
     ],
 )
 logger = logging.getLogger()
+
+class _InstanceLogFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            record.instance_id = str(os.getenv("INSTANCE_ID") or "").strip() or "main"
+        except Exception:
+            record.instance_id = "main"
+        return True
+
+try:
+    _f = _InstanceLogFilter()
+    for _h in list(getattr(logger, "handlers", []) or []):
+        try:
+            _h.addFilter(_f)
+        except Exception:
+            pass
+except Exception:
+    pass
 
 def _safe_read_json(path: str) -> dict:
     try:
@@ -240,6 +263,13 @@ class GridTradingBot:
         self._instance_last_equity = None
         self._instance_last_equity_ts = 0.0
         self._status_log_interval_sec = float(STATUS_LOG_INTERVAL_SEC or 60.0)
+        self._trail_peak_price_long = None
+        self._trail_trough_price_short = None
+        self._trail_anchor_entry_long = None
+        self._trail_anchor_entry_short = None
+        self._last_error_msg = None
+        self._last_error_ts = 0.0
+        self._err_rl = {}
 
         self.is_grid_stopped = False
         self._last_risk_eval_ts = 0.0
@@ -316,7 +346,7 @@ class GridTradingBot:
             "alive": True,
             "health": {
                 "state": state,
-                "last_error": None,
+                "last_error": getattr(self, "_last_error_msg", None),
                 "last_ws_ts": float(self._last_ws_msg_ts or 0.0),
                 "last_ticker_ts": float(self.last_ticker_update_time or 0.0),
                 "last_rest_pos_sync_ts": float(self.last_position_update_time or 0.0),
@@ -491,7 +521,10 @@ class GridTradingBot:
                 self._applied_margin_mode = desired
                 logger.info(f"保证金模式无需变更: {mm}")
                 return
-            self._margin_mode_backoff_until_ts = now + 15.0
+            if ("\"code\":-1000" in msg) or ("code': -1000" in msg) or ("code=-1000" in msg):
+                self._margin_mode_backoff_until_ts = now + 120.0
+            else:
+                self._margin_mode_backoff_until_ts = now + 30.0
             logger.error(f"设置保证金模式失败: {e}")
 
     def _apply_leverage_from_config(self, force: bool = False):
@@ -533,7 +566,11 @@ class GridTradingBot:
             self._applied_leverage = lev_i
             logger.info(f"已设置杠杆倍数: {lev_i}x")
         except Exception as e:
-            self._leverage_backoff_until_ts = now + 15.0
+            msg = str(e)
+            if ("\"code\":-1000" in msg) or ("code': -1000" in msg) or ("code=-1000" in msg):
+                self._leverage_backoff_until_ts = now + 120.0
+            else:
+                self._leverage_backoff_until_ts = now + 30.0
             logger.error(f"设置杠杆失败: {e}")
 
     def _position_amount_from_ccxt_position(self, position: dict) -> float:
@@ -603,6 +640,27 @@ class GridTradingBot:
             return float(v)
         except Exception:
             return None
+
+    def _set_last_error(self, msg: str):
+        s = str(msg or "").strip()
+        if not s:
+            return
+        self._last_error_msg = s
+        self._last_error_ts = time.time()
+
+    def _err_rate_limit(self, key: str, interval_sec: float = 10.0) -> bool:
+        now = time.time()
+        try:
+            last = float((self._err_rl or {}).get(key) or 0.0)
+        except Exception:
+            last = 0.0
+        if (now - last) < float(interval_sec or 0.0):
+            return False
+        try:
+            self._err_rl[key] = now
+        except Exception:
+            pass
+        return True
 
     def round_amount(self, quantity: float):
         q = self._safe_float(quantity)
@@ -724,11 +782,19 @@ class GridTradingBot:
         if qty is None:
             return None
         if float(qty) <= 0:
+            if self._err_rate_limit("order_qty_round_to_zero", 15.0):
+                self._set_last_error(
+                    f"下单金额过小：每格金额={float(s):.6f} 计算数量={float(qty_raw):.6f}，按数量精度={int(self.amount_precision or 0)}舍入后为0；请提高“每格金额”"
+                )
             return None
         min_amt = float(self.min_order_amount or 0.0)
         if min_amt > 0 and float(qty) < min_amt:
             min_notional = float(min_amt) * float(denom)
             if min_notional > float(s) * 1.05:
+                if self._err_rate_limit("min_order_notional_too_high", 15.0):
+                    self._set_last_error(
+                        f"下单金额过小：每格金额={float(s):.6f} < 最小下单名义={float(min_notional):.6f}；请提高“每格金额”"
+                    )
                 return None
             qty2 = self.round_amount(min_amt)
             if qty2 is None or float(qty2) <= 0:
@@ -1323,6 +1389,29 @@ class GridTradingBot:
         if ep is None or cp is None or ep <= 0 or cp <= 0:
             return None
 
+        if s == "long":
+            anchor = self._safe_float(getattr(self, "_trail_anchor_entry_long", None))
+            if anchor is None or anchor <= 0 or abs(float(anchor) - float(ep)) / float(ep) >= 0.01:
+                setattr(self, "_trail_anchor_entry_long", float(ep))
+                setattr(self, "_trail_peak_price_long", float(cp))
+            peak = self._safe_float(getattr(self, "_trail_peak_price_long", None))
+            if peak is None or peak <= 0:
+                peak = float(cp)
+            if float(cp) > float(peak):
+                peak = float(cp)
+                setattr(self, "_trail_peak_price_long", float(peak))
+        else:
+            anchor = self._safe_float(getattr(self, "_trail_anchor_entry_short", None))
+            if anchor is None or anchor <= 0 or abs(float(anchor) - float(ep)) / float(ep) >= 0.01:
+                setattr(self, "_trail_anchor_entry_short", float(ep))
+                setattr(self, "_trail_trough_price_short", float(cp))
+            trough = self._safe_float(getattr(self, "_trail_trough_price_short", None))
+            if trough is None or trough <= 0:
+                trough = float(cp)
+            if float(cp) < float(trough):
+                trough = float(cp)
+                setattr(self, "_trail_trough_price_short", float(trough))
+
         candidates = []
         base_ratio = self._safe_float(cfg.get("TRAILING_STOP_BASE_STOP_RATIO", 0.0))
         if base_ratio is not None and base_ratio > 0:
@@ -1352,6 +1441,28 @@ class GridTradingBot:
                     candidates.append(ep * (1.0 + float(best)))
                 else:
                     candidates.append(ep * (1.0 - float(best)))
+
+        pb_ladder = cfg.get("TRAILING_PULLBACK_LADDER") or []
+        if isinstance(pb_ladder, list) and pb_ladder:
+            if s == "long":
+                pr = (float(peak) / float(ep)) - 1.0
+            else:
+                pr = (float(ep) / float(trough)) - 1.0
+            best_pb = None
+            for item in pb_ladder:
+                if not isinstance(item, dict):
+                    continue
+                tr = self._safe_float(item.get("trigger_ratio"))
+                pb = self._safe_float(item.get("pullback_ratio"))
+                if tr is None or pb is None:
+                    continue
+                if pr >= float(tr):
+                    best_pb = float(pb) if best_pb is None else min(float(best_pb), float(pb))
+            if best_pb is not None and float(best_pb) > 0:
+                if s == "long":
+                    candidates.append(float(peak) * (1.0 - float(best_pb)))
+                else:
+                    candidates.append(float(trough) * (1.0 + float(best_pb)))
 
         hs_price = self._safe_float(cfg.get("HARD_STOPLOSS_PRICE", 0.0))
         if hs_price is not None and hs_price > 0:
@@ -1488,6 +1599,12 @@ class GridTradingBot:
         amt = float(((snap.get(side) or {}).get("amt") or 0.0))
         entry = self._safe_float((snap.get(side) or {}).get("entry_price"))
         if amt <= 0 or entry is None or entry <= 0:
+            if side == "long":
+                self._trail_peak_price_long = None
+                self._trail_anchor_entry_long = None
+            else:
+                self._trail_trough_price_short = None
+                self._trail_anchor_entry_short = None
             async with self.lock:
                 self._cancel_stop_orders_for_side(side)
             return
@@ -1663,6 +1780,7 @@ class GridTradingBot:
         exchange = CustomGate({
             "apiKey": self.api_key,
             "secret": self.api_secret,
+            "timeout": 15000,
             "enableRateLimit": True,
             "options": {
                 "defaultType": "future",  # 使用永续合约
@@ -2070,6 +2188,7 @@ class GridTradingBot:
                 logger.info(f"同步 orders: 多头买单 {self.buy_long_orders} 张, 多头卖单 {self.sell_long_orders} 张,空头卖单 {self.sell_short_orders} 张, 空头买单 {self.buy_short_orders} 张 @ ticker")
 
             await self.maybe_update_trailing_stop()
+            await self.maybe_trigger_take_profit()
             await self.maybe_trigger_hard_stoploss()
             await self.adjust_grid_strategy()
 
@@ -2224,11 +2343,82 @@ class GridTradingBot:
         except Exception:
             pass
         try:
+            await self.maybe_trigger_take_profit()
+        except Exception:
+            pass
+        try:
             await self.maybe_trigger_hard_stoploss()
         except Exception:
             pass
         try:
             await self.adjust_grid_strategy()
+        except Exception:
+            pass
+
+    async def maybe_trigger_take_profit(self):
+        if self.shutdown_event.is_set():
+            return
+        if bool(getattr(self, "is_grid_stopped", False)):
+            return
+
+        cfg = self.risk_engine.get_config()
+        self._apply_runtime_settings_from_config()
+        if not bool(cfg.get("TAKE_PROFIT_ENABLED", False)):
+            return
+        tp_price = self._safe_float(cfg.get("TAKE_PROFIT_PRICE", 0.0))
+        if tp_price is None or float(tp_price) <= 0:
+            return
+
+        side = str(self.direction or "long").strip().lower()
+        if side not in {"long", "short"}:
+            side = "long"
+
+        if side == "long":
+            px = self._safe_float(getattr(self, "best_bid_price", None))
+            if px is None or px <= 0:
+                px = self._safe_float(getattr(self, "latest_price", None))
+            if px is None or px <= 0 or float(px) < float(tp_price):
+                return
+        else:
+            px = self._safe_float(getattr(self, "best_ask_price", None))
+            if px is None or px <= 0:
+                px = self._safe_float(getattr(self, "latest_price", None))
+            if px is None or px <= 0 or float(px) > float(tp_price):
+                return
+
+        await self._trigger_take_profit(side, float(tp_price), float(px))
+
+    async def _trigger_take_profit(self, side: str, tp_price: float, current_price: float):
+        if self.shutdown_event.is_set():
+            return
+        if bool(getattr(self, "is_grid_stopped", False)):
+            return
+
+        self.is_grid_stopped = True
+        self._force_orders_resync = False
+
+        logger.info(f"【自定义止盈触发】side={side} price={current_price:.6f} tp_price={tp_price:.6f}")
+
+        async with self.lock:
+            try:
+                self.cancel_all_open_orders()
+            except Exception:
+                pass
+            try:
+                self._cancel_stop_orders_for_side("long")
+            except Exception:
+                pass
+            try:
+                self._cancel_stop_orders_for_side("short")
+            except Exception:
+                pass
+            try:
+                self.flatten_all_positions_market()
+            except Exception:
+                pass
+
+        try:
+            await self.shutdown("take_profit")
         except Exception:
             pass
 
@@ -2742,8 +2932,18 @@ if __name__ == "__main__":
                 return
             if bot.shutdown_event.is_set():
                 return
+            sig_name = None
+            try:
+                sig_name = getattr(sig, "name", None)
+            except Exception:
+                sig_name = None
+            if not sig_name:
+                try:
+                    sig_name = signal.Signals(int(sig)).name
+                except Exception:
+                    sig_name = str(sig)
             loop.call_soon_threadsafe(
-                lambda: asyncio.create_task(bot.shutdown(f"signal_{getattr(sig, 'name', str(sig))}"))
+                lambda: asyncio.create_task(bot.shutdown(f"signal_{sig_name}"))
             )
 
         for sig in (getattr(signal, "SIGINT", None), getattr(signal, "SIGTERM", None), getattr(signal, "SIGBREAK", None)):

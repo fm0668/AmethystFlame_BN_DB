@@ -46,8 +46,18 @@ if __name__ == "__main__":
                 return
             if bot.shutdown_event.is_set():
                 return
+            sig_name = None
+            try:
+                sig_name = getattr(sig, "name", None)
+            except Exception:
+                sig_name = None
+            if not sig_name:
+                try:
+                    sig_name = signal.Signals(int(sig)).name
+                except Exception:
+                    sig_name = str(sig)
             loop.call_soon_threadsafe(
-                lambda: asyncio.create_task(bot.shutdown(f"signal_{getattr(sig, 'name', str(sig))}"))
+                lambda: asyncio.create_task(bot.shutdown(f"signal_{sig_name}"))
             )
 
         for sig in (getattr(signal, "SIGINT", None), getattr(signal, "SIGTERM", None), getattr(signal, "SIGBREAK", None)):

@@ -131,6 +131,11 @@ def main():
     stopping = False
     status_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "status")
     os.makedirs(status_dir, exist_ok=True)
+    for sid in ("slot_01", "slot_02", "slot_03"):
+        try:
+            os.remove(os.path.join(status_dir, f"{sid}.start"))
+        except Exception:
+            pass
 
     def _pid_path_for_config(path: str) -> str:
         sid = os.path.splitext(os.path.basename(path))[0]
@@ -153,6 +158,10 @@ def main():
     def _restart_flag_path_for_config(path: str) -> str:
         sid = os.path.splitext(os.path.basename(path))[0]
         return os.path.join(status_dir, f"{sid}.restart")
+
+    def _start_flag_path_for_config(path: str) -> str:
+        sid = os.path.splitext(os.path.basename(path))[0]
+        return os.path.join(status_dir, f"{sid}.start")
 
     def _pid_exists(pid: int) -> bool:
         if pid is None:
@@ -226,6 +235,8 @@ def main():
             except Exception:
                 continue
             if not _enabled_from_config(path):
+                continue
+            if not os.path.exists(_start_flag_path_for_config(path)):
                 continue
             direction = _direction_from_config(path)
             desired[path] = {"direction": direction}

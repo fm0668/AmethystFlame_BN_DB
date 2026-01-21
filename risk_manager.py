@@ -60,9 +60,12 @@ class RiskEngine:
             "HARD_STOPLOSS_CHECK_INTERVAL_SEC": 1.0,
             "STOP_ON_HARDSTOP": True,
             "HARD_STOPLOSS_PRICE": 0.0,
+            "TAKE_PROFIT_ENABLED": False,
+            "TAKE_PROFIT_PRICE": 0.0,
             "TRAILING_STOP_ENABLED": False,
             "TRAILING_STOP_BASE_STOP_RATIO": 0.0,
             "TRAILING_STOP_LADDER": [],
+            "TRAILING_PULLBACK_LADDER": [],
             "ORDER_CLIENT_ID_PREFIX": "AF",
             "HOT_RELOAD_ENABLED": True,
             "CONFIG_WATCH_INTERVAL_SEC": 1.0,
@@ -113,9 +116,12 @@ class RiskEngine:
             "硬止损检查间隔秒": "HARD_STOPLOSS_CHECK_INTERVAL_SEC",
             "硬止损后停止策略": "STOP_ON_HARDSTOP",
             "硬止损价格": "HARD_STOPLOSS_PRICE",
+            "止盈启用": "TAKE_PROFIT_ENABLED",
+            "止盈价格": "TAKE_PROFIT_PRICE",
             "启用移动止损": "TRAILING_STOP_ENABLED",
             "移动止损初始止损比例": "TRAILING_STOP_BASE_STOP_RATIO",
             "移动止损阶梯": "TRAILING_STOP_LADDER",
+            "移动止损回撤阶梯": "TRAILING_PULLBACK_LADDER",
             "订单ID前缀": "ORDER_CLIENT_ID_PREFIX",
             "启用热加载": "HOT_RELOAD_ENABLED",
             "热加载检查间隔秒": "CONFIG_WATCH_INTERVAL_SEC",
@@ -177,6 +183,13 @@ class RiskEngine:
             if "价格" in stop:
                 out["HARD_STOPLOSS_PRICE"] = stop.get("价格")
 
+        tp = raw.get("止盈")
+        if isinstance(tp, dict):
+            if "启用" in tp:
+                out["TAKE_PROFIT_ENABLED"] = tp.get("启用")
+            if "价格" in tp:
+                out["TAKE_PROFIT_PRICE"] = tp.get("价格")
+
         trailing = raw.get("移动硬止损")
         if not isinstance(trailing, dict):
             trailing = raw.get("移动止损")
@@ -187,6 +200,8 @@ class RiskEngine:
                 out["TRAILING_STOP_BASE_STOP_RATIO"] = trailing.get("初始止损比例")
             if "阶梯" in trailing:
                 out["TRAILING_STOP_LADDER"] = trailing.get("阶梯")
+            if "回撤阶梯" in trailing:
+                out["TRAILING_PULLBACK_LADDER"] = trailing.get("回撤阶梯")
 
         account_mode = raw.get("账户模式") or raw.get("交易环境") or raw.get("ACCOUNT_MODE") or raw.get("account_mode") or raw.get("环境")
         if account_mode is not None and "账户模式" in raw:
@@ -270,6 +285,12 @@ class RiskEngine:
             raise ValueError("HARD_STOPLOSS_PRICE must be >= 0")
         cfg["HARD_STOPLOSS_PRICE"] = float(hs_price)
 
+        cfg["TAKE_PROFIT_ENABLED"] = bool(cfg.get("TAKE_PROFIT_ENABLED", False))
+        tp_price = float(cfg.get("TAKE_PROFIT_PRICE", 0.0) or 0.0)
+        if tp_price < 0:
+            raise ValueError("TAKE_PROFIT_PRICE must be >= 0")
+        cfg["TAKE_PROFIT_PRICE"] = float(tp_price)
+
         cfg["TRAILING_STOP_ENABLED"] = bool(cfg.get("TRAILING_STOP_ENABLED", False))
         base_ratio = float(cfg.get("TRAILING_STOP_BASE_STOP_RATIO", 0.0) or 0.0)
         if base_ratio < 0:
@@ -299,6 +320,28 @@ class RiskEngine:
             norm_ladder.append({"trigger_ratio": float(trig_f), "stop_ratio": float(stop_f)})
         norm_ladder.sort(key=lambda x: float(x["trigger_ratio"]))
         cfg["TRAILING_STOP_LADDER"] = norm_ladder
+
+        pb_ladder = cfg.get("TRAILING_PULLBACK_LADDER", [])
+        if pb_ladder is None:
+            pb_ladder = []
+        if not isinstance(pb_ladder, list):
+            raise ValueError("TRAILING_PULLBACK_LADDER must be a list")
+        norm_pb = []
+        for item in pb_ladder:
+            if not isinstance(item, dict):
+                continue
+            trig = item.get("触发盈利比例") if "触发盈利比例" in item else item.get("trigger_ratio")
+            pb = item.get("回撤比例") if "回撤比例" in item else item.get("pullback_ratio")
+            try:
+                trig_f = float(trig)
+                pb_f = float(pb)
+            except Exception:
+                continue
+            if trig_f < 0 or pb_f <= 0 or pb_f >= 1:
+                continue
+            norm_pb.append({"trigger_ratio": float(trig_f), "pullback_ratio": float(pb_f)})
+        norm_pb.sort(key=lambda x: float(x["trigger_ratio"]))
+        cfg["TRAILING_PULLBACK_LADDER"] = norm_pb
 
         cfg["HOT_RELOAD_ENABLED"] = bool(cfg.get("HOT_RELOAD_ENABLED", True))
         watch_itv = float(cfg.get("CONFIG_WATCH_INTERVAL_SEC", 1.0))

@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import subprocess
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -29,6 +30,33 @@ def _safe_write_json_atomic(path: str, obj):
     os.replace(tmp, path)
 
 
+def _pid_alive(pid: int) -> bool:
+    if pid is None:
+        return False
+    try:
+        pid_i = int(pid)
+    except Exception:
+        return False
+    if pid_i <= 0:
+        return False
+    try:
+        if os.name == "nt":
+            r = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid_i}", "/NH"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                text=True,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            out = (r.stdout or "").strip()
+            return str(pid_i) in out
+        os.kill(pid_i, 0)
+        return True
+    except Exception:
+        return False
+
+
 def _slot_config_path(slot_id: str) -> str:
     return os.path.join(_CONFIGS_DIR, f"{slot_id}.json")
 
@@ -36,9 +64,15 @@ def _slot_config_path(slot_id: str) -> str:
 def _slot_status_path(slot_id: str) -> str:
     return os.path.join(_STATUS_DIR, f"{slot_id}.json")
 
+def _slot_pid_path(slot_id: str) -> str:
+    return os.path.join(_STATUS_DIR, f"{slot_id}.pid")
+
 
 def _slot_stop_flag_path(slot_id: str) -> str:
     return os.path.join(_STATUS_DIR, f"{slot_id}.stop")
+
+def _slot_start_flag_path(slot_id: str) -> str:
+    return os.path.join(_STATUS_DIR, f"{slot_id}.start")
 
 def _slot_restart_flag_path(slot_id: str) -> str:
     return os.path.join(_STATUS_DIR, f"{slot_id}.restart")
@@ -92,6 +126,7 @@ def _editable_view(cfg: dict) -> dict:
     sync = cfg.get("同步") if isinstance(cfg.get("同步"), dict) else {}
     hs = cfg.get("硬止损") if isinstance(cfg.get("硬止损"), dict) else {}
     ts = cfg.get("移动硬止损") if isinstance(cfg.get("移动硬止损"), dict) else {}
+    tp = cfg.get("止盈") if isinstance(cfg.get("止盈"), dict) else {}
     inst = cfg.get("实例") if isinstance(cfg.get("实例"), dict) else {}
     pair = cfg.get("交易对") if isinstance(cfg.get("交易对"), dict) else {}
     margin_mode = str(cfg.get("保证金模式") or "").strip()
@@ -117,7 +152,13 @@ def _editable_view(cfg: dict) -> dict:
             "状态日志间隔秒": sync.get("状态日志间隔秒"),
         },
         "硬止损": {"价格": hs.get("价格")},
-        "移动硬止损": {"启用": _parse_bool(ts.get("启用"), False), "初始止损比例": ts.get("初始止损比例"), "阶梯": ts.get("阶梯")},
+        "移动硬止损": {
+            "启用": _parse_bool(ts.get("启用"), False),
+            "初始止损比例": ts.get("初始止损比例"),
+            "阶梯": ts.get("阶梯"),
+            "回撤阶梯": ts.get("回撤阶梯"),
+        },
+        "止盈": {"启用": _parse_bool(tp.get("启用"), False), "价格": tp.get("价格")},
     }
 
 
@@ -189,7 +230,21 @@ def _apply_update(cfg: dict, update: dict) -> dict:
         ts["初始止损比例"] = float(up_ts.get("初始止损比例"))
     if "阶梯" in up_ts and up_ts.get("阶梯") is not None:
         ts["阶梯"] = up_ts.get("阶梯")
+    if "回撤阶梯" in up_ts and up_ts.get("回撤阶梯") is not None:
+        ts["回撤阶梯"] = up_ts.get("回撤阶梯")
     out["移动硬止损"] = ts
+
+    tp = out.get("止盈") if isinstance(out.get("止盈"), dict) else {}
+    up_tp = update.get("止盈") or {}
+    if "启用" in up_tp:
+        tp["启用"] = _parse_bool(up_tp.get("启用"), False)
+    if "价格" in up_tp and up_tp.get("价格") is not None:
+        v = up_tp.get("价格")
+        if str(v).strip() == "":
+            v = None
+        if v is not None:
+            tp["价格"] = float(v)
+    out["止盈"] = tp
 
     return out
 
@@ -332,7 +387,10 @@ async function loadConfigIntoCard(id, force){
   c.hard.value = ((cfg['硬止损']||{})['价格'] ?? '');
   c.tsEnable.value = (((cfg['移动硬止损']||{})['启用']===true)?'true':'false');
   c.tsBase.value = ((cfg['移动硬止损']||{})['初始止损比例'] ?? '');
+  c.tpEnable.value = (((cfg['止盈']||{})['启用']===true))?'true':'false';
+  c.tpPrice.value = ((cfg['止盈']||{})['价格'] ?? '');
   const ladder = ((cfg['移动硬止损']||{})['阶梯'] || []);
+  const pbLadder = ((cfg['移动硬止损']||{})['回撤阶梯'] || []);
   c.ladderRows = [];
   c.ladderRowsEl.innerHTML = '';
   if(Array.isArray(ladder)){
@@ -340,6 +398,15 @@ async function loadConfigIntoCard(id, force){
       const tr = (it && (it['触发盈利比例'] ?? it['trigger_ratio'])) ?? '';
       const sr = (it && (it['止损盈利比例'] ?? it['stop_ratio'])) ?? '';
       c.addLadderRow(tr, sr);
+    }
+  }
+  c.pbRows = [];
+  c.pbRowsEl.innerHTML = '';
+  if(Array.isArray(pbLadder)){
+    for(const it of pbLadder){
+      const tr = (it && (it['触发盈利比例'] ?? it['trigger_ratio'])) ?? '';
+      const pr = (it && (it['回撤比例'] ?? it['pullback_ratio'])) ?? '';
+      c.addPbRow(tr, pr);
     }
   }
   clearDirty(id);
@@ -371,9 +438,11 @@ function ensureCard(slot){
   const stPnl = el('div', {html:''});
   const stDd = el('div', {html:''});
   const stNotional = el('div', {html:''});
+  const stErr = el('div', {html:''});
   statusBox.appendChild(stSymbol);
   statusBox.appendChild(stDir);
   statusBox.appendChild(stMode);
+  statusBox.appendChild(stErr);
   statusBox.appendChild(stEquity);
   statusBox.appendChild(stPnl);
   statusBox.appendChild(stDd);
@@ -398,12 +467,20 @@ function ensureCard(slot){
   const hard = el('input');
   const tsEnable = el('select'); tsEnable.innerHTML = `<option value="false">否</option><option value="true">是</option>`;
   const tsBase = el('input');
+  const tpEnable = el('select'); tpEnable.innerHTML = `<option value="false">否</option><option value="true">是</option>`;
+  const tpPrice = el('input');
   const ladderWrap = el('div');
   const ladderRowsEl = el('div');
   const ladderAddBtn = el('button', {html:'添加阶梯'});
   ladderAddBtn.type = 'button';
   ladderWrap.appendChild(ladderRowsEl);
   ladderWrap.appendChild(ladderAddBtn);
+  const pbWrap = el('div');
+  const pbRowsEl = el('div');
+  const pbAddBtn = el('button', {html:'添加回撤阶梯'});
+  pbAddBtn.type = 'button';
+  pbWrap.appendChild(pbRowsEl);
+  pbWrap.appendChild(pbAddBtn);
   form.appendChild(el('div',{html:'环境'})); form.appendChild(mode);
   form.appendChild(el('div',{html:'保证金模式'})); form.appendChild(marginMode);
   form.appendChild(el('div',{html:'币'})); form.appendChild(coin);
@@ -420,6 +497,9 @@ function ensureCard(slot){
   form.appendChild(el('div',{html:'移动硬止损'})); form.appendChild(tsEnable);
   form.appendChild(el('div',{html:'初始止损比例'})); form.appendChild(tsBase);
   form.appendChild(el('div',{html:'移动止损阶梯'})); form.appendChild(ladderWrap);
+  form.appendChild(el('div',{html:'跟踪回撤阶梯'})); form.appendChild(pbWrap);
+  form.appendChild(el('div',{html:'止盈启用'})); form.appendChild(tpEnable);
+  form.appendChild(el('div',{html:'止盈价格'})); form.appendChild(tpPrice);
   card.appendChild(levList);
   card.appendChild(form);
 
@@ -440,7 +520,7 @@ function ensureCard(slot){
     n.addEventListener('input', ()=>markDirty(slot.id));
     n.addEventListener('change', ()=>markDirty(slot.id));
   }
-  [coin,quote,dir,mode,marginMode,spacing,money,leverage,maker,alloc,baseEnable,baseAmount,hard,tsEnable,tsBase].forEach(bindDirty);
+  [coin,quote,dir,mode,marginMode,spacing,money,leverage,maker,alloc,baseEnable,baseAmount,hard,tsEnable,tsBase,tpEnable,tpPrice].forEach(bindDirty);
 
   function addLadderRow(trigger, stop){
     const row = el('div', {class:'ladder-row'});
@@ -458,6 +538,22 @@ function ensureCard(slot){
   }
   ladderAddBtn.onclick = ()=>{ addLadderRow('', ''); markDirty(slot.id); };
 
+  function addPbRow(trigger, pullback){
+    const row = el('div', {class:'ladder-row'});
+    const tr = el('input'); tr.value = (trigger ?? '');
+    const pr = el('input'); pr.value = (pullback ?? '');
+    const del = el('button', {html:'删除'}); del.type = 'button';
+    row.appendChild(tr);
+    row.appendChild(pr);
+    row.appendChild(del);
+    pbRowsEl.appendChild(row);
+    bindDirty(tr);
+    bindDirty(pr);
+    del.onclick = ()=>{ row.remove(); markDirty(slot.id); };
+    return {tr, pr};
+  }
+  pbAddBtn.onclick = ()=>{ addPbRow('', ''); markDirty(slot.id); };
+
   saveBtn.onclick = async ()=>{
     await withPending(saveBtn, async ()=>{
       const ladder = [];
@@ -469,6 +565,15 @@ function ensureCard(slot){
           ladder.push({"触发盈利比例": tr, "止损盈利比例": sr});
         }
       }
+      const pb = [];
+      for(const row of Array.from(pbRowsEl.querySelectorAll('.ladder-row'))){
+        const inputs = row.querySelectorAll('input');
+        const tr = inputs.length > 0 ? toNumOrNull(inputs[0].value) : null;
+        const pr = inputs.length > 1 ? toNumOrNull(inputs[1].value) : null;
+        if(tr!=null && pr!=null){
+          pb.push({"触发盈利比例": tr, "回撤比例": pr});
+        }
+      }
       await api(`/api/slots/${slot.id}/config`, {method:'PUT', body: JSON.stringify({
         "账户模式": mode.value,
         "保证金模式": marginMode.value,
@@ -477,7 +582,8 @@ function ensureCard(slot){
         "资金": {"分配资金": alloc.value},
         "底仓": {"启用": (baseEnable.value==='true'), "金额": baseAmount.value},
         "硬止损": {"价格": hard.value},
-        "移动硬止损": {"启用": (tsEnable.value==='true'), "初始止损比例": tsBase.value, "阶梯": ladder}
+        "移动硬止损": {"启用": (tsEnable.value==='true'), "初始止损比例": tsBase.value, "阶梯": ladder, "回撤阶梯": pb},
+        "止盈": {"启用": (tpEnable.value==='true'), "价格": toNumOrNull(tpPrice.value)}
       })});
       clearDirty(slot.id);
       await refreshSlotsOnce();
@@ -489,7 +595,7 @@ function ensureCard(slot){
   refreshBtn.onclick = async ()=>{ await withPending(refreshBtn, async ()=>{ await loadConfigIntoCard(slot.id, true); await resetStatusIfOfflineOrStopped(slot.id); await refreshSlotsOnce(); }); };
 
   root.appendChild(card);
-  const entry = {id:slot.id, card, badge, state, stSymbol, stDir, stMode, stEquity, stPnl, stDd, stNotional, dirtyEl, mode, marginMode, coin, quote, dir, spacing, money, leverage, maker, alloc, baseEnable, baseAmount, hard, tsEnable, tsBase, ladderRowsEl, ladderRows: [], addLadderRow, dirty:false};
+  const entry = {id:slot.id, card, badge, state, stSymbol, stDir, stMode, stErr, stEquity, stPnl, stDd, stNotional, dirtyEl, mode, marginMode, coin, quote, dir, spacing, money, leverage, maker, alloc, baseEnable, baseAmount, hard, tsEnable, tsBase, tpEnable, tpPrice, ladderRowsEl, ladderRows: [], addLadderRow, pbRowsEl, pbRows: [], addPbRow, dirty:false};
   cards.set(slot.id, entry);
   loadConfigIntoCard(slot.id, false).catch(()=>{});
   return entry;
@@ -503,6 +609,7 @@ function updateStatus(slot){
   c.stSymbol.textContent = `交易对：${slot.symbol||'-'}`;
   c.stDir.textContent = `方向：${slot.direction||'-'}`;
   c.stMode.textContent = `环境：${slot.account_mode||'实盘'}`;
+  c.stErr.textContent = `最后错误：${slot.last_error||'-'}`;
   c.stEquity.textContent = `实例权益：${(slot.equity_usdt!=null)?f2(slot.equity_usdt):'-'}`;
   c.stPnl.textContent = `实例盈亏：${(slot.pnl_usdt!=null)?f2(slot.pnl_usdt):'-'}`;
   c.stDd.textContent = `最大回撤：${(slot.max_drawdown_ratio!=null)?(Number(slot.max_drawdown_ratio)*100).toFixed(2)+'%':'-'}`;
@@ -598,6 +705,15 @@ class Handler(BaseHTTPRequestHandler):
                         alive = (now - float(ts)) <= float(grace)
                     except Exception:
                         alive = False
+                if not alive:
+                    pid = None
+                    try:
+                        s = open(_slot_pid_path(sid), "r", encoding="utf-8").read().strip()
+                        pid = int(s)
+                    except Exception:
+                        pid = None
+                    if pid is not None and _pid_alive(pid):
+                        alive = True
                 slots.append(
                     {
                         "id": sid,
@@ -607,6 +723,7 @@ class Handler(BaseHTTPRequestHandler):
                         "direction": _normalize_direction(((cfg.get("网格") or {}).get("方向"))),
                         "alive": alive,
                         "state": ((st.get("health") or {}).get("state")) if isinstance(st, dict) else None,
+                        "last_error": ((st.get("health") or {}).get("last_error")) if isinstance(st, dict) else None,
                         "equity_usdt": ((st.get("accounting") or {}).get("equity_usdt")) if isinstance(st, dict) else None,
                         "pnl_usdt": ((st.get("accounting") or {}).get("pnl_usdt")) if isinstance(st, dict) else None,
                         "max_drawdown_ratio": ((st.get("accounting") or {}).get("max_drawdown_ratio")) if isinstance(st, dict) else None,
@@ -691,6 +808,12 @@ class Handler(BaseHTTPRequestHandler):
                     os.remove(_slot_stop_flag_path(sid))
                 except Exception:
                     pass
+                try:
+                    os.makedirs(_STATUS_DIR, exist_ok=True)
+                    with open(_slot_start_flag_path(sid), "w", encoding="utf-8") as f:
+                        f.write(str(time.time()))
+                except Exception:
+                    pass
                 self._send(200, {"ok": True})
                 return
             if action == "stop":
@@ -707,6 +830,10 @@ class Handler(BaseHTTPRequestHandler):
                     os.remove(_slot_restart_flag_path(sid))
                 except Exception:
                     pass
+                try:
+                    os.remove(_slot_start_flag_path(sid))
+                except Exception:
+                    pass
                 self._send(200, {"ok": True})
                 return
             if action == "restart":
@@ -720,6 +847,12 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     os.makedirs(_STATUS_DIR, exist_ok=True)
                     with open(_slot_restart_flag_path(sid), "w", encoding="utf-8") as f:
+                        f.write(str(time.time()))
+                except Exception:
+                    pass
+                try:
+                    os.makedirs(_STATUS_DIR, exist_ok=True)
+                    with open(_slot_start_flag_path(sid), "w", encoding="utf-8") as f:
                         f.write(str(time.time()))
                 except Exception:
                     pass
