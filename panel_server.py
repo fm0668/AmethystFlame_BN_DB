@@ -556,43 +556,47 @@ function ensureCard(slot){
 
   saveBtn.onclick = async ()=>{
     await withPending(saveBtn, async ()=>{
-      const ladder = [];
-      for(const row of Array.from(ladderRowsEl.querySelectorAll('.ladder-row'))){
-        const inputs = row.querySelectorAll('input');
-        const tr = inputs.length > 0 ? toNumOrNull(inputs[0].value) : null;
-        const sr = inputs.length > 1 ? toNumOrNull(inputs[1].value) : null;
-        if(tr!=null && sr!=null){
-          ladder.push({"触发盈利比例": tr, "止损盈利比例": sr});
+      try{
+        const ladder = [];
+        for(const row of Array.from(ladderRowsEl.querySelectorAll('.ladder-row'))){
+          const inputs = row.querySelectorAll('input');
+          const tr = inputs.length > 0 ? toNumOrNull(inputs[0].value) : null;
+          const sr = inputs.length > 1 ? toNumOrNull(inputs[1].value) : null;
+          if(tr!=null && sr!=null){
+            ladder.push({"触发盈利比例": tr, "止损盈利比例": sr});
+          }
         }
-      }
-      const pb = [];
-      for(const row of Array.from(pbRowsEl.querySelectorAll('.ladder-row'))){
-        const inputs = row.querySelectorAll('input');
-        const tr = inputs.length > 0 ? toNumOrNull(inputs[0].value) : null;
-        const pr = inputs.length > 1 ? toNumOrNull(inputs[1].value) : null;
-        if(tr!=null && pr!=null){
-          pb.push({"触发盈利比例": tr, "回撤比例": pr});
+        const pb = [];
+        for(const row of Array.from(pbRowsEl.querySelectorAll('.ladder-row'))){
+          const inputs = row.querySelectorAll('input');
+          const tr = inputs.length > 0 ? toNumOrNull(inputs[0].value) : null;
+          const pr = inputs.length > 1 ? toNumOrNull(inputs[1].value) : null;
+          if(tr!=null && pr!=null){
+            pb.push({"触发盈利比例": tr, "回撤比例": pr});
+          }
         }
+        await api(`/api/slots/${slot.id}/config`, {method:'PUT', body: JSON.stringify({
+          "账户模式": mode.value,
+          "保证金模式": marginMode.value,
+          "交易对": {"币": coin.value, "计价": quote.value},
+          "网格": {"方向": dir.value, "间距比例": spacing.value, "每格金额": money.value, "杠杆倍数": leverage.value, "只做MAKER": (maker.value==='true')},
+          "资金": {"分配资金": alloc.value},
+          "底仓": {"启用": (baseEnable.value==='true'), "金额": baseAmount.value},
+          "硬止损": {"价格": hard.value},
+          "移动硬止损": {"启用": (tsEnable.value==='true'), "初始止损比例": tsBase.value, "阶梯": ladder, "回撤阶梯": pb},
+          "止盈": {"启用": (tpEnable.value==='true'), "价格": toNumOrNull(tpPrice.value)}
+        })});
+        clearDirty(slot.id);
+        await refreshSlotsOnce();
+      }catch(e){
+        alert(e && e.message ? e.message : String(e));
       }
-      await api(`/api/slots/${slot.id}/config`, {method:'PUT', body: JSON.stringify({
-        "账户模式": mode.value,
-        "保证金模式": marginMode.value,
-        "交易对": {"币": coin.value, "计价": quote.value},
-        "网格": {"方向": dir.value, "间距比例": spacing.value, "每格金额": money.value, "杠杆倍数": leverage.value, "只做MAKER": (maker.value==='true')},
-        "资金": {"分配资金": alloc.value},
-        "底仓": {"启用": (baseEnable.value==='true'), "金额": baseAmount.value},
-        "硬止损": {"价格": hard.value},
-        "移动硬止损": {"启用": (tsEnable.value==='true'), "初始止损比例": tsBase.value, "阶梯": ladder, "回撤阶梯": pb},
-        "止盈": {"启用": (tpEnable.value==='true'), "价格": toNumOrNull(tpPrice.value)}
-      })});
-      clearDirty(slot.id);
-      await refreshSlotsOnce();
     });
   };
-  startBtn.onclick = async ()=>{ await withPending(startBtn, async ()=>{ await api(`/api/slots/${slot.id}/action`, {method:'POST', body: JSON.stringify({action:'start'})}); await refreshSlotsOnce(); }); };
-  restartBtn.onclick = async ()=>{ await withPending(restartBtn, async ()=>{ await api(`/api/slots/${slot.id}/action`, {method:'POST', body: JSON.stringify({action:'restart'})}); await refreshSlotsOnce(); }); };
-  stopBtn.onclick = async ()=>{ await withPending(stopBtn, async ()=>{ await api(`/api/slots/${slot.id}/action`, {method:'POST', body: JSON.stringify({action:'stop'})}); await refreshSlotsOnce(); }); };
-  refreshBtn.onclick = async ()=>{ await withPending(refreshBtn, async ()=>{ await loadConfigIntoCard(slot.id, true); await resetStatusIfOfflineOrStopped(slot.id); await refreshSlotsOnce(); }); };
+  startBtn.onclick = async ()=>{ await withPending(startBtn, async ()=>{ try{ await api(`/api/slots/${slot.id}/action`, {method:'POST', body: JSON.stringify({action:'start'})}); await refreshSlotsOnce(); }catch(e){ alert(e && e.message ? e.message : String(e)); } }); };
+  restartBtn.onclick = async ()=>{ await withPending(restartBtn, async ()=>{ try{ await api(`/api/slots/${slot.id}/action`, {method:'POST', body: JSON.stringify({action:'restart'})}); await refreshSlotsOnce(); }catch(e){ alert(e && e.message ? e.message : String(e)); } }); };
+  stopBtn.onclick = async ()=>{ await withPending(stopBtn, async ()=>{ try{ await api(`/api/slots/${slot.id}/action`, {method:'POST', body: JSON.stringify({action:'stop'})}); await refreshSlotsOnce(); }catch(e){ alert(e && e.message ? e.message : String(e)); } }); };
+  refreshBtn.onclick = async ()=>{ await withPending(refreshBtn, async ()=>{ try{ await loadConfigIntoCard(slot.id, true); await resetStatusIfOfflineOrStopped(slot.id); await refreshSlotsOnce(); }catch(e){ alert(e && e.message ? e.message : String(e)); } }); };
 
   root.appendChild(card);
   const entry = {id:slot.id, card, badge, state, stSymbol, stDir, stMode, stErr, stEquity, stPnl, stDd, stNotional, dirtyEl, mode, marginMode, coin, quote, dir, spacing, money, leverage, maker, alloc, baseEnable, baseAmount, hard, tsEnable, tsBase, tpEnable, tpPrice, ladderRowsEl, ladderRows: [], addLadderRow, pbRowsEl, pbRows: [], addPbRow, dirty:false};
