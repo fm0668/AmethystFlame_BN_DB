@@ -139,7 +139,6 @@ def _editable_view(cfg: dict) -> dict:
         "交易对": {
             "币": str(pair.get("币") or "").strip().upper(),
             "计价": str(pair.get("计价") or "").strip().upper(),
-            "别名": str(pair.get("别名") or "").strip(),
         },
         "网格": {
             "方向": _normalize_direction(grid.get("方向")),
@@ -184,8 +183,6 @@ def _apply_update(cfg: dict, update: dict) -> dict:
     coin, quote = _validate_symbol(up_pair.get("币") or pair.get("币"), up_pair.get("计价") or pair.get("计价"))
     pair["币"] = coin
     pair["计价"] = quote
-    if "别名" in up_pair:
-        pair["别名"] = str(up_pair.get("别名") or "").strip()
     out["交易对"] = pair
 
     grid = out.get("网格") if isinstance(out.get("网格"), dict) else {}
@@ -381,7 +378,6 @@ async function loadConfigIntoCard(id, force){
   c.mode.value = (cfg['账户模式']||'实盘');
   c.marginMode.value = (cfg['保证金模式']||'逐仓');
   c.coin.value = (cfg['交易对']||{})['币']||'';
-  c.coinAlias.value = (cfg['交易对']||{})['别名']||'';
   c.quote.value = (cfg['交易对']||{})['计价']||'USDT';
   c.dir.value = ((cfg['网格']||{})['方向']||'做多');
   c.spacing.value = ((cfg['网格']||{})['间距比例'] ?? '');
@@ -458,7 +454,6 @@ function ensureCard(slot){
 
   const form = el('div', {class:'kv'});
   const coin = el('input');
-  const coinAlias = el('input');
   const quote = el('select'); quote.innerHTML = `<option>USDT</option><option>USDC</option>`;
   const dir = el('select'); dir.innerHTML = `<option>做多</option><option>做空</option>`;
   const mode = el('select'); mode.innerHTML = `<option>实盘</option><option>测试网络</option>`;
@@ -492,7 +487,6 @@ function ensureCard(slot){
   form.appendChild(el('div',{html:'环境'})); form.appendChild(mode);
   form.appendChild(el('div',{html:'保证金模式'})); form.appendChild(marginMode);
   form.appendChild(el('div',{html:'币(交易代码)'})); form.appendChild(coin);
-  form.appendChild(el('div',{html:'币别名'})); form.appendChild(coinAlias);
   form.appendChild(el('div',{html:'计价'})); form.appendChild(quote);
   form.appendChild(el('div',{html:'方向'})); form.appendChild(dir);
   form.appendChild(el('div',{html:'间距比例'})); form.appendChild(spacing);
@@ -529,7 +523,7 @@ function ensureCard(slot){
     n.addEventListener('input', ()=>markDirty(slot.id));
     n.addEventListener('change', ()=>markDirty(slot.id));
   }
-  [coin,coinAlias,quote,dir,mode,marginMode,spacing,money,leverage,maker,alloc,baseEnable,baseAmount,hard,tsEnable,tsBase,tpEnable,tpPrice].forEach(bindDirty);
+  [coin,quote,dir,mode,marginMode,spacing,money,leverage,maker,alloc,baseEnable,baseAmount,hard,tsEnable,tsBase,tpEnable,tpPrice].forEach(bindDirty);
 
   function addLadderRow(trigger, stop){
     const row = el('div', {class:'ladder-row'});
@@ -587,7 +581,7 @@ function ensureCard(slot){
         await api(`/api/slots/${slot.id}/config`, {method:'PUT', body: JSON.stringify({
           "账户模式": mode.value,
           "保证金模式": marginMode.value,
-          "交易对": {"币": coin.value, "计价": quote.value, "别名": coinAlias.value},
+          "交易对": {"币": coin.value, "计价": quote.value},
           "网格": {"方向": dir.value, "间距比例": spacing.value, "每格金额": money.value, "杠杆倍数": leverage.value, "只做MAKER": (maker.value==='true')},
           "资金": {"分配资金": alloc.value},
           "底仓": {"启用": (baseEnable.value==='true'), "金额": baseAmount.value},
@@ -608,7 +602,7 @@ function ensureCard(slot){
   refreshBtn.onclick = async ()=>{ await withPending(refreshBtn, async ()=>{ try{ await loadConfigIntoCard(slot.id, true); await resetStatusIfOfflineOrStopped(slot.id); await refreshSlotsOnce(); }catch(e){ alert(e && e.message ? e.message : String(e)); } }); };
 
   root.appendChild(card);
-  const entry = {id:slot.id, card, badge, state, stSymbol, stDir, stMode, stErr, stEquity, stPnl, stDd, stNotional, dirtyEl, mode, marginMode, coin, coinAlias, quote, dir, spacing, money, leverage, maker, alloc, baseEnable, baseAmount, hard, tsEnable, tsBase, tpEnable, tpPrice, ladderRowsEl, ladderRows: [], addLadderRow, pbRowsEl, pbRows: [], addPbRow, dirty:false};
+  const entry = {id:slot.id, card, badge, state, stSymbol, stDir, stMode, stErr, stEquity, stPnl, stDd, stNotional, dirtyEl, mode, marginMode, coin, quote, dir, spacing, money, leverage, maker, alloc, baseEnable, baseAmount, hard, tsEnable, tsBase, tpEnable, tpPrice, ladderRowsEl, ladderRows: [], addLadderRow, pbRowsEl, pbRows: [], addPbRow, dirty:false};
   cards.set(slot.id, entry);
   loadConfigIntoCard(slot.id, false).catch(()=>{});
   return entry;
