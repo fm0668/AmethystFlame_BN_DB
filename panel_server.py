@@ -112,8 +112,8 @@ def _parse_bool(v, default: bool = False) -> bool:
 def _validate_symbol(coin: str, quote: str):
     c = str(coin or "").strip().upper()
     q = str(quote or "").strip().upper()
-    if not re.fullmatch(r"[A-Z0-9]{1,15}", c or ""):
-        raise ValueError("币种格式无效，应为1-15位字母数字（交易代码），如ETH/SOL/BTC")
+    if not re.fullmatch(r"[A-Z0-9\u4e00-\u9fff]{1,15}", c or ""):
+        raise ValueError("币种格式无效，应为1-15位字母/数字/中文（交易代码），如ETH/SOL/币安人生")
     if q not in {"USDT", "USDC"}:
         raise ValueError("计价只允许USDT或USDC")
     return c, q
