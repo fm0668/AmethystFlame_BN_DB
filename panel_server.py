@@ -161,7 +161,10 @@ def _editable_view(cfg: dict) -> dict:
             "阶梯": ts.get("阶梯"),
             "回撤阶梯": ts.get("回撤阶梯"),
         },
-        "止盈": {"启用": _parse_bool(tp.get("启用"), False), "价格": tp.get("价格")},
+        "止盈": {
+            "启用": _parse_bool(tp.get("启用"), False),
+            "价格": (tp.get("价格") if _parse_bool(tp.get("启用"), False) else None),
+        },
     }
 
 
@@ -241,12 +244,14 @@ def _apply_update(cfg: dict, update: dict) -> dict:
     up_tp = update.get("止盈") or {}
     if "启用" in up_tp:
         tp["启用"] = _parse_bool(up_tp.get("启用"), False)
-    if "价格" in up_tp and up_tp.get("价格") is not None:
+    if "价格" in up_tp:
         v = up_tp.get("价格")
-        if str(v).strip() == "":
-            v = None
-        if v is not None:
+        if v is None or str(v).strip() == "":
+            tp.pop("价格", None)
+        else:
             tp["价格"] = float(v)
+    if tp.get("启用") is False:
+        tp.pop("价格", None)
     out["止盈"] = tp
 
     return out
@@ -319,6 +324,8 @@ function stateCN(state){
   if(s==='running') return '运行中';
   if(s==='stopped') return '已停止';
   if(s==='shutdown') return '已退出';
+  if(s==='hard_stoploss') return '已止损';
+  if(s==='take_profit') return '已止盈';
   return state;
 }
 function stateDisplay(slot){

@@ -88,6 +88,92 @@ def _safe_read_json(path: str) -> dict:
         pass
     return {}
 
+def _safe_write_json_atomic(path: str, obj: dict) -> bool:
+    try:
+        d = os.path.dirname(os.path.abspath(path))
+        os.makedirs(d, exist_ok=True)
+        tmp = f"{path}.tmp.{int(time.time() * 1000)}"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        try:
+            if tmp and os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+        return False
+
+def _disable_instance_autostart(config_path: str, status_dir: str, instance_id: str) -> None:
+    sid = str(instance_id or "").strip()
+    if not sid:
+        return
+    try:
+        start_flag = os.path.join(status_dir, f"{sid}.start")
+        if os.path.exists(start_flag):
+            os.remove(start_flag)
+    except Exception:
+        pass
+    try:
+        restart_flag = os.path.join(status_dir, f"{sid}.restart")
+        if os.path.exists(restart_flag):
+            os.remove(restart_flag)
+    except Exception:
+        pass
+    try:
+        cfg = _safe_read_json(config_path) or {}
+        inst = cfg.get("实例") if isinstance(cfg.get("实例"), dict) else {}
+        inst["启用"] = False
+        cfg["实例"] = inst
+        _safe_write_json_atomic(config_path, cfg)
+    except Exception:
+        pass
+
+def _ui_state_for_shutdown_reason(reason: str):
+    r = str(reason or "").strip().lower()
+    if ("take_profit" in r) or ("tp" == r):
+        return "take_profit", "已止盈"
+    if ("hard_stop" in r) or ("stoploss" in r) or ("stop_loss" in r) or ("sl" == r):
+        return "hard_stoploss", "已止损"
+    return None, None
+
+def _is_stop_like_ws_order(order: dict) -> bool:
+    if not isinstance(order, dict):
+        return False
+    ot = str(order.get("o") or "").strip().upper()
+    o2 = str(order.get("ot") or "").strip().upper()
+    t = ot or o2
+    if t in {"STOP_MARKET", "TAKE_PROFIT_MARKET", "STOP", "TAKE_PROFIT"}:
+        return True
+    sp = order.get("sp")
+    try:
+        sp_f = float(sp)
+    except Exception:
+        sp_f = 0.0
+    if sp_f > 0:
+        return True
+    return False
+
+def _stop_reason_from_ws_order(order: dict):
+    if not isinstance(order, dict):
+        return None
+    ot = str(order.get("o") or "").strip().upper()
+    o2 = str(order.get("ot") or "").strip().upper()
+    t = ot or o2
+    if "TAKE_PROFIT" in t:
+        return "take_profit"
+    sp = order.get("sp")
+    try:
+        sp_f = float(sp)
+    except Exception:
+        sp_f = 0.0
+    if sp_f > 0:
+        return "hard_stoploss"
+    if "STOP" in t:
+        return "hard_stoploss"
+    return None
+
 def _normalize_account_mode(value) -> str:
     s = str(value or "").strip().lower()
     if s in {"testnet", "paper", "sim", "sandbox", "测试网", "测试", "模拟", "仿真", "测试网络", "测试网路"}:
@@ -329,7 +415,8 @@ class GridTradingBot:
         now = time.time()
         state = "stopped" if bool(getattr(self, "is_grid_stopped", False)) else "running"
         if self.shutdown_event.is_set():
-            state = "shutdown"
+            s, _ = _ui_state_for_shutdown_reason(getattr(self, "_shutdown_reason", None))
+            state = s or "shutdown"
 
         stop_price = None
         try:
@@ -1482,17 +1569,17 @@ class GridTradingBot:
             return None
         return float(stop_price)
 
-    def _upsert_stop_market(self, side: str, qty: float, stop_price: float):
+    def _upsert_stop_market(self, side: str, qty: float, stop_price: float) -> str:
         s = str(side or "").strip().lower()
         q = self._safe_float(qty)
         sp = self._safe_float(stop_price)
         if s not in {"long", "short"} or q is None or sp is None:
-            return
+            return "invalid"
         if q <= 0 or sp <= 0:
-            return
+            return "invalid"
         now = time.time()
         if (now - float(getattr(self, "_last_stop_update_ts", 0.0) or 0.0)) < 1.0:
-            return
+            return "throttled"
         self._last_stop_update_ts = now
 
         required_ps = None
@@ -1525,7 +1612,7 @@ class GridTradingBot:
                 continue
 
         if len(candidates) == 1 and float(candidates[0]["stop"] or 0.0) == float(desired_stop):
-            return
+            return "ok"
 
         last_purge = float(getattr(self, "_last_stop_purge_ts", 0.0) or 0.0)
         if (now - last_purge) >= 3.0 and candidates:
@@ -1548,15 +1635,42 @@ class GridTradingBot:
             params = {"stopPrice": float(sp), "closePosition": True}
         try:
             self.exchange.create_order(self.ccxt_symbol, "STOP_MARKET", desired_o_side, float(q), None, params)
+            self._refresh_open_orders_cache()
+            return "ok"
         except Exception as e:
             msg = str(e)
+            if ("-2021" in msg) or ("immediately trigger" in msg):
+                try:
+                    px = None
+                    if s == "long":
+                        px = self._safe_float(getattr(self, "best_bid_price", None))
+                    else:
+                        px = self._safe_float(getattr(self, "best_ask_price", None))
+                    if px is None or float(px or 0.0) <= 0:
+                        px = self._safe_float(getattr(self, "latest_price", None))
+                    if px is None or float(px or 0.0) <= 0:
+                        return "immediate_trigger"
+                    if s == "long":
+                        retry_stop = min(float(sp), float(px) * 0.995)
+                    else:
+                        retry_stop = max(float(sp), float(px) * 1.005)
+                    retry_stop = round(float(retry_stop), int(self.price_precision or 0))
+                    if retry_stop <= 0:
+                        return "immediate_trigger"
+                    retry_params = dict(params or {})
+                    retry_params["stopPrice"] = float(retry_stop)
+                    self.exchange.create_order(self.ccxt_symbol, "STOP_MARKET", desired_o_side, float(q), None, retry_params)
+                    self._refresh_open_orders_cache()
+                    return "ok"
+                except Exception:
+                    return "immediate_trigger"
             if "4130" in msg:
                 backoff_until = float(getattr(self, "_stop_backoff_until_ts", 0.0) or 0.0)
                 if now < backoff_until:
-                    return
+                    return "skipped"
                 setattr(self, "_stop_backoff_until_ts", now + 60.0)
                 logger.info("止损单已存在(交易所限制同方向closePosition条件单唯一)，跳过更新")
-                return
+                return "ok"
             if "4045" in msg:
                 try:
                     self._raw_purge_stop_like_orders(
@@ -1570,12 +1684,39 @@ class GridTradingBot:
                 try:
                     self.exchange.create_order(self.ccxt_symbol, "STOP_MARKET", desired_o_side, float(q), None, params)
                     self._refresh_open_orders_cache()
-                    return
+                    return "ok"
                 except Exception as e2:
+                    msg2 = str(e2)
+                    if ("-2021" in msg2) or ("immediately trigger" in msg2):
+                        try:
+                            px = None
+                            if s == "long":
+                                px = self._safe_float(getattr(self, "best_bid_price", None))
+                            else:
+                                px = self._safe_float(getattr(self, "best_ask_price", None))
+                            if px is None or float(px or 0.0) <= 0:
+                                px = self._safe_float(getattr(self, "latest_price", None))
+                            if px is None or float(px or 0.0) <= 0:
+                                return "immediate_trigger"
+                            if s == "long":
+                                retry_stop = min(float(sp), float(px) * 0.995)
+                            else:
+                                retry_stop = max(float(sp), float(px) * 1.005)
+                            retry_stop = round(float(retry_stop), int(self.price_precision or 0))
+                            if retry_stop <= 0:
+                                return "immediate_trigger"
+                            retry_params = dict(params or {})
+                            retry_params["stopPrice"] = float(retry_stop)
+                            self.exchange.create_order(self.ccxt_symbol, "STOP_MARKET", desired_o_side, float(q), None, retry_params)
+                            self._refresh_open_orders_cache()
+                            return "ok"
+                        except Exception:
+                            return "immediate_trigger"
                     logger.error(f"更新止损单失败: {e2}")
             else:
                 logger.error(f"更新止损单失败: {e}")
         self._refresh_open_orders_cache()
+        return "error"
 
     async def maybe_update_trailing_stop(self):
         if self.shutdown_event.is_set():
@@ -1608,8 +1749,23 @@ class GridTradingBot:
         stop_price = self._compute_trailing_stop_price(side, float(entry), float(self.latest_price), cfg)
         if stop_price is None:
             return
+        px = self._safe_float(getattr(self, "best_bid_price" if side == "long" else "best_ask_price", None))
+        if px is None or float(px or 0.0) <= 0:
+            px = self._safe_float(getattr(self, "latest_price", None))
+        if px is None:
+            px = 0.0
+        breached = (float(px) <= float(stop_price)) if side == "long" else (float(px) >= float(stop_price))
+        if breached:
+            pnl = float(self._safe_float((snap.get(side) or {}).get("pnl")) or 0.0)
+            await self._trigger_hardstop(side, pnl, reason=f"trailing_stop_breached price={float(px):.6f} stop_price={float(stop_price):.6f}")
+            return
+        upsert_result = None
         async with self.lock:
-            self._upsert_stop_market(side, float(amt), float(stop_price))
+            upsert_result = self._upsert_stop_market(side, float(amt), float(stop_price))
+        if upsert_result == "immediate_trigger":
+            pnl = float(self._safe_float((snap.get(side) or {}).get("pnl")) or 0.0)
+            await self._trigger_hardstop(side, pnl, reason="stop_order_would_immediately_trigger")
+            return
 
     async def maybe_trigger_hard_stoploss(self):
         if self.shutdown_event.is_set():
@@ -2176,6 +2332,7 @@ class GridTradingBot:
 
     async def handle_order_update(self, message):
         need_eval = False
+        shutdown_reason = None
         async with self.lock:
             data = json.loads(message)
             if data.get("e") != "ORDER_TRADE_UPDATE":
@@ -2233,6 +2390,14 @@ class GridTradingBot:
                         self.sell_fills += 1
                         self.short_position += filled
                         self.sell_short_orders = max(0.0, self.sell_short_orders - filled)
+
+                if reduce_only and _is_stop_like_ws_order(order):
+                    r = _stop_reason_from_ws_order(order) or "hard_stoploss"
+                    closed_side = "short" if side == "BUY" else "long"
+                    if closed_side == "long" and float(self.long_position or 0.0) <= 0:
+                        shutdown_reason = r
+                    if closed_side == "short" and float(self.short_position or 0.0) <= 0:
+                        shutdown_reason = r
 
                 if exec_type == "TRADE":
                     if trade_sig is None or trade_sig not in self._last_trade_id_seen:
@@ -2307,6 +2472,13 @@ class GridTradingBot:
                             anchor_ps = "LONG" if str(self.direction or "long") == "long" else "SHORT"
                     self._update_anchor_after_fill(anchor_ps, float(fill_price or 0.0))
                 need_eval = True
+
+        if shutdown_reason and (not self.shutdown_event.is_set()):
+            try:
+                await self.shutdown(shutdown_reason)
+            except Exception:
+                pass
+            return
 
         if need_eval:
             self._kick_risk_eval()
@@ -2843,8 +3015,21 @@ class GridTradingBot:
             self.shutdown_event.set()
             return
         self._shutting_down = True
+        self._shutdown_reason = str(reason or "").strip()
         self.shutdown_event.set()
         logger.info(f"开始优雅退出: {reason}")
+        try:
+            s, msg = _ui_state_for_shutdown_reason(reason)
+            if msg:
+                self._set_last_error(msg)
+        except Exception:
+            pass
+        try:
+            r = str(reason or "").strip().lower()
+            if ("hard_stop" in r) or ("take_profit" in r) or ("stoploss" in r) or ("stop_loss" in r):
+                _disable_instance_autostart(self.strategy_config_path, self._status_dir, self.instance_id)
+        except Exception:
+            pass
         try:
             self._write_status_file()
         except Exception:
