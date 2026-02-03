@@ -109,26 +109,40 @@ def _disable_instance_autostart(config_path: str, status_dir: str, instance_id: 
     sid = str(instance_id or "").strip()
     if not sid:
         return
-    try:
-        start_flag = os.path.join(status_dir, f"{sid}.start")
-        if os.path.exists(start_flag):
+    start_flag = os.path.join(status_dir, f"{sid}.start")
+    restart_flag = os.path.join(status_dir, f"{sid}.restart")
+    if os.path.exists(start_flag):
+        try:
             os.remove(start_flag)
-    except Exception:
-        pass
-    try:
-        restart_flag = os.path.join(status_dir, f"{sid}.restart")
-        if os.path.exists(restart_flag):
+        except Exception as e:
+            try:
+                logger.warning(f"删除自启动标记失败: {start_flag} ({e})")
+            except Exception:
+                pass
+    if os.path.exists(restart_flag):
+        try:
             os.remove(restart_flag)
-    except Exception:
-        pass
+        except Exception as e:
+            try:
+                logger.warning(f"删除重启标记失败: {restart_flag} ({e})")
+            except Exception:
+                pass
     try:
         cfg = _safe_read_json(config_path) or {}
         inst = cfg.get("实例") if isinstance(cfg.get("实例"), dict) else {}
         inst["启用"] = False
         cfg["实例"] = inst
-        _safe_write_json_atomic(config_path, cfg)
-    except Exception:
-        pass
+        ok = _safe_write_json_atomic(config_path, cfg)
+        if not ok:
+            try:
+                logger.warning(f"写入配置失败(无法禁用实例): {config_path}")
+            except Exception:
+                pass
+    except Exception as e:
+        try:
+            logger.warning(f"禁用实例自启动失败: {config_path} ({e})")
+        except Exception:
+            pass
 
 def _ui_state_for_shutdown_reason(reason: str):
     r = str(reason or "").strip().lower()
@@ -2142,7 +2156,8 @@ class GridTradingBot:
             cfg = self.risk_engine.get_config() or {}
         except Exception:
             cfg = {}
-        if not bool(cfg.get("ENABLE_BASE_POSITION", False)):
+        grid_enabled = bool(cfg.get("GRID_ENABLED", True))
+        if grid_enabled and (not bool(cfg.get("ENABLE_BASE_POSITION", False))):
             return
         base_usdc = self._safe_float(cfg.get("BASE_POSITION_USDC", 0.0))
         if base_usdc is None or float(base_usdc) <= 0:
@@ -2349,7 +2364,9 @@ class GridTradingBot:
             quantity = float(order.get("q", 0))
             filled = float(order.get("z", 0))
             remaining = quantity - filled
-            reduce_only = bool(order.get("R")) or bool(order.get("reduceOnly")) or bool(order.get("reduce_only"))
+            reduce_only_flag = _parse_env_bool(order.get("R"), False) or _parse_env_bool(order.get("reduceOnly"), False) or _parse_env_bool(order.get("reduce_only"), False)
+            close_position = _parse_env_bool(order.get("cp"), False) or _parse_env_bool(order.get("closePosition"), False) or _parse_env_bool(order.get("close_position"), False)
+            reduce_only = bool(reduce_only_flag or close_position)
             exec_type = str(order.get("x") or order.get("X") or "").strip().upper()
             trade_id = order.get("t")
             if trade_id is None:
@@ -2720,6 +2737,7 @@ class GridTradingBot:
 
         cfg = self.risk_engine.get_config()
         self._apply_runtime_settings_from_config()
+        grid_enabled = bool(cfg.get("GRID_ENABLED", True))
         maker_only = self._maker_only_enabled()
         min_interval = float(cfg.get("RISK_EVAL_MIN_INTERVAL_SEC", 0.8))
         now = time.time()
@@ -2730,6 +2748,24 @@ class GridTradingBot:
         async with self.lock:
             if bool(getattr(self, "is_grid_stopped", False)):
                 return
+            if not grid_enabled:
+                try:
+                    active_side = str(self.direction or "long").strip().lower()
+                    if active_side not in {"long", "short"}:
+                        active_side = "long"
+                    purge_needed = bool(getattr(self, "_force_orders_resync", False)) or (not bool(getattr(self, "_grid_disabled_purged", False)))
+                    if purge_needed and (not self._in_grid_action_cooldown(active_side)):
+                        self._mark_grid_action(active_side)
+                        try:
+                            self.cancel_orders_for_side(active_side)
+                        except Exception:
+                            pass
+                        self._grid_disabled_purged = True
+                except Exception:
+                    pass
+                self._force_orders_resync = False
+                return
+            self._grid_disabled_purged = False
 
             try:
                 orders = self._get_open_orders_cached(max_age_sec=0.5) or []
@@ -3026,8 +3062,15 @@ class GridTradingBot:
             pass
         try:
             r = str(reason or "").strip().lower()
-            if ("hard_stop" in r) or ("take_profit" in r) or ("stoploss" in r) or ("stop_loss" in r):
+            halt_for_risk = ("hard_stop" in r) or ("take_profit" in r) or ("stoploss" in r) or ("stop_loss" in r)
+            if halt_for_risk:
                 _disable_instance_autostart(self.strategy_config_path, self._status_dir, self.instance_id)
+                try:
+                    os.makedirs(self._status_dir, exist_ok=True)
+                    with open(self._stop_flag_path, "w", encoding="utf-8") as f:
+                        f.write(str(time.time()))
+                except Exception:
+                    pass
         except Exception:
             pass
         try:
@@ -3035,7 +3078,10 @@ class GridTradingBot:
         except Exception:
             pass
         try:
-            os.remove(self._stop_flag_path)
+            r = str(reason or "").strip().lower()
+            halt_for_risk = ("hard_stop" in r) or ("take_profit" in r) or ("stoploss" in r) or ("stop_loss" in r)
+            if not halt_for_risk:
+                os.remove(self._stop_flag_path)
         except Exception:
             pass
         try:

@@ -12,4 +12,7 @@ status/
 
 网格面板(UI) 参数说明.md
 项目设计书_单边网格.md
+.trae/
+verify_*.py
+VPS*.md
 

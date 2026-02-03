@@ -238,6 +238,12 @@ def main():
                 continue
             if not os.path.exists(_start_flag_path_for_config(path)):
                 continue
+            try:
+                sid = os.path.splitext(os.path.basename(path))[0]
+                if os.path.exists(os.path.join(status_dir, f"{sid}.stop")):
+                    continue
+            except Exception:
+                pass
             direction = _direction_from_config(path)
             desired[path] = {"direction": direction}
 

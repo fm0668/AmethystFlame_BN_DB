@@ -26,6 +26,7 @@ class RiskEngine:
             "MAKER_ONLY": False,
             "DIRECTION": "long",
             "ALLOCATED_CAPITAL_USDC": 0.0,
+            "GRID_ENABLED": True,
             "ENABLE_BASE_POSITION": False,
             "BASE_POSITION_USDC": 0.0,
             "BASE_GRID_SPACING": 0.0025,
@@ -57,6 +58,7 @@ class RiskEngine:
             "allocated_capital": "ALLOCATED_CAPITAL_USDC",
             "allocated_capital_usdc": "ALLOCATED_CAPITAL_USDC",
             "allocated_capital_usdt": "ALLOCATED_CAPITAL_USDC",
+            "启用网格": "GRID_ENABLED",
             "启用底仓": "ENABLE_BASE_POSITION",
             "底仓金额": "BASE_POSITION_USDC",
             "只做MAKER": "MAKER_ONLY",
@@ -94,6 +96,8 @@ class RiskEngine:
 
         grid = raw.get("网格")
         if isinstance(grid, dict):
+            if "启用" in grid:
+                out["GRID_ENABLED"] = grid.get("启用")
             if "方向" in grid:
                 out["DIRECTION"] = grid.get("方向")
             if "间距比例" in grid:
@@ -186,6 +190,7 @@ class RiskEngine:
             raise ValueError("ALLOCATED_CAPITAL_USDC must be >= 0")
         cfg["ALLOCATED_CAPITAL_USDC"] = float(allocated)
 
+        cfg["GRID_ENABLED"] = bool(cfg.get("GRID_ENABLED", True))
         cfg["ENABLE_BASE_POSITION"] = bool(cfg.get("ENABLE_BASE_POSITION", False))
         base_pos = float(cfg.get("BASE_POSITION_USDC", 0.0) or 0.0)
         if base_pos < 0:
