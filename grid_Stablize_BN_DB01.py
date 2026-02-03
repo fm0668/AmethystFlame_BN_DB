@@ -367,6 +367,8 @@ class GridTradingBot:
         self._trail_trough_price_short = None
         self._trail_anchor_entry_long = None
         self._trail_anchor_entry_short = None
+        self._trail_stop_price_long = None
+        self._trail_stop_price_short = None
         self._last_error_msg = None
         self._last_error_ts = 0.0
         self._err_rl = {}
@@ -1693,16 +1695,16 @@ class GridTradingBot:
         base_ratio = self._safe_float(cfg.get("TRAILING_STOP_BASE_STOP_RATIO", 0.0))
         if base_ratio is not None and base_ratio > 0:
             if s == "long":
-                candidates.append(ep * (1.0 - float(base_ratio)))
+                candidates.append(float(peak) * (1.0 - float(base_ratio)))
             else:
-                candidates.append(ep * (1.0 + float(base_ratio)))
+                candidates.append(float(trough) * (1.0 + float(base_ratio)))
 
         ladder = cfg.get("TRAILING_STOP_LADDER") or []
         if isinstance(ladder, list):
             if s == "long":
-                profit_ratio = (cp / ep) - 1.0
+                profit_ratio = (float(peak) / ep) - 1.0
             else:
-                profit_ratio = (ep / cp) - 1.0
+                profit_ratio = (ep / float(trough)) - 1.0
             best = None
             for item in ladder:
                 if not isinstance(item, dict):
@@ -1750,16 +1752,23 @@ class GridTradingBot:
 
         if s == "long":
             stop_price = max(float(x) for x in candidates if x is not None and float(x) > 0)
-            if stop_price >= float(cp):
-                stop_price = float(cp) * 0.999
         else:
             stop_price = min(float(x) for x in candidates if x is not None and float(x) > 0)
-            if stop_price <= float(cp):
-                stop_price = float(cp) * 1.001
 
         stop_price = round(float(stop_price), int(self.price_precision or 0))
         if stop_price <= 0:
             return None
+        prev = None
+        if s == "long":
+            prev = self._safe_float(getattr(self, "_trail_stop_price_long", None))
+            if prev is not None and prev > 0:
+                stop_price = max(float(stop_price), float(prev))
+            setattr(self, "_trail_stop_price_long", float(stop_price))
+        else:
+            prev = self._safe_float(getattr(self, "_trail_stop_price_short", None))
+            if prev is not None and prev > 0:
+                stop_price = min(float(stop_price), float(prev))
+            setattr(self, "_trail_stop_price_short", float(stop_price))
         return float(stop_price)
 
     def _upsert_stop_market(self, side: str, qty: float, stop_price: float) -> str:
@@ -2001,9 +2010,11 @@ class GridTradingBot:
             if side == "long":
                 self._trail_peak_price_long = None
                 self._trail_anchor_entry_long = None
+                self._trail_stop_price_long = None
             else:
                 self._trail_trough_price_short = None
                 self._trail_anchor_entry_short = None
+                self._trail_stop_price_short = None
             async with self.lock:
                 self._cancel_stop_orders_for_side(side)
             return
