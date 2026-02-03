@@ -1624,19 +1624,17 @@ class GridTradingBot:
         tp = self._safe_float(trigger_price)
         if tp is None or float(tp) <= 0:
             raise ValueError("invalid trigger price")
-        binance_type = ot
         params = {
             "symbol": mid,
             "side": sd,
             "algoType": "CONDITIONAL",
-            "type": str(binance_type),
-            "orderType": ot,
-            "timeInForce": "GTC",
+            "type": ot,
             "triggerPrice": float(tp),
-            "price": float(tp),
             "workingType": "CONTRACT_PRICE",
             "priceProtect": False,
         }
+        if ot in {"STOP", "TAKE_PROFIT"}:
+            params["timeInForce"] = "GTC"
         if client_algo_id:
             params["clientAlgoId"] = str(client_algo_id)
         if position_side is not None:
@@ -1650,6 +1648,10 @@ class GridTradingBot:
             if q is None or q <= 0:
                 raise ValueError("invalid quantity")
             params["quantity"] = float(q)
+        if ot in {"STOP", "TAKE_PROFIT"}:
+            if bool(close_position):
+                raise ValueError(f"invalid order type for closePosition: {ot}")
+            params["price"] = float(tp)
         return self._fapi_private_call(
             ["fapiPrivatePostAlgoOrder", "fapiPrivatePostAlgoorder"],
             "algoOrder",
@@ -1860,7 +1862,7 @@ class GridTradingBot:
 
         try:
             algo_side = "SELL" if desired_o_side == "sell" else "BUY"
-            algo_debug = f"algoOrder type=STOP side={algo_side} triggerPrice={float(sp)} positionSide={required_ps if bool(getattr(self, '_hedge_mode', False)) else None} closePosition=True"
+            algo_debug = f"algoOrder type=STOP_MARKET side={algo_side} triggerPrice={float(sp)} positionSide={required_ps if bool(getattr(self, '_hedge_mode', False)) else None} closePosition=True"
             self._place_algo_conditional_order(
                 "STOP_MARKET",
                 algo_side,
@@ -1891,7 +1893,7 @@ class GridTradingBot:
                     if retry_stop <= 0:
                         return "immediate_trigger"
                     algo_side = "SELL" if desired_o_side == "sell" else "BUY"
-                    algo_debug_retry = f"algoOrder type=STOP side={algo_side} triggerPrice={float(retry_stop)} positionSide={required_ps if bool(getattr(self, '_hedge_mode', False)) else None} closePosition=True"
+                    algo_debug_retry = f"algoOrder type=STOP_MARKET side={algo_side} triggerPrice={float(retry_stop)} positionSide={required_ps if bool(getattr(self, '_hedge_mode', False)) else None} closePosition=True"
                     self._place_algo_conditional_order(
                         "STOP_MARKET",
                         algo_side,
@@ -1922,7 +1924,7 @@ class GridTradingBot:
                     pass
                 try:
                     algo_side = "SELL" if desired_o_side == "sell" else "BUY"
-                    algo_debug_4045 = f"algoOrder type=STOP side={algo_side} triggerPrice={float(sp)} positionSide={required_ps if bool(getattr(self, '_hedge_mode', False)) else None} closePosition=True"
+                    algo_debug_4045 = f"algoOrder type=STOP_MARKET side={algo_side} triggerPrice={float(sp)} positionSide={required_ps if bool(getattr(self, '_hedge_mode', False)) else None} closePosition=True"
                     self._place_algo_conditional_order(
                         "STOP_MARKET",
                         algo_side,
@@ -1953,7 +1955,7 @@ class GridTradingBot:
                             if retry_stop <= 0:
                                 return "immediate_trigger"
                             algo_side = "SELL" if desired_o_side == "sell" else "BUY"
-                            algo_debug_4045_retry = f"algoOrder type=STOP side={algo_side} triggerPrice={float(retry_stop)} positionSide={required_ps if bool(getattr(self, '_hedge_mode', False)) else None} closePosition=True"
+                            algo_debug_4045_retry = f"algoOrder type=STOP_MARKET side={algo_side} triggerPrice={float(retry_stop)} positionSide={required_ps if bool(getattr(self, '_hedge_mode', False)) else None} closePosition=True"
                             self._place_algo_conditional_order(
                                 "STOP_MARKET",
                                 algo_side,
