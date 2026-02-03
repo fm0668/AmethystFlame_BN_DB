@@ -1392,6 +1392,31 @@ class GridTradingBot:
                     self.cancel_order(oid)
             except Exception:
                 continue
+        market_id = self._raw_market_id()
+        if market_id:
+            desired_o_side = "sell" if s == "long" else "buy"
+            algo_orders = self._fetch_open_algo_orders(market_id)
+            for ao in (algo_orders or []):
+                try:
+                    raw = ao or {}
+                    status = str(raw.get("algoStatus") or raw.get("status") or "").strip().upper()
+                    if status and status not in {"NEW"}:
+                        continue
+                    ot = str(raw.get("orderType") or raw.get("type") or "").strip().upper()
+                    if ("STOP" not in ot) and ("TAKE_PROFIT" not in ot) and ("TRAILING" not in ot):
+                        continue
+                    a_side = str(raw.get("side") or "").strip().lower()
+                    if a_side != desired_o_side:
+                        continue
+                    if required_ps is not None:
+                        ps = str(raw.get("positionSide") or "").strip().upper()
+                        if ps and ps not in {required_ps, "BOTH"}:
+                            continue
+                    aid = raw.get("algoId")
+                    if aid is not None:
+                        self._cancel_algo_order(aid, market_id)
+                except Exception:
+                    continue
         self._stop_order_id = None
         self._refresh_open_orders_cache()
 
@@ -1460,6 +1485,36 @@ class GridTradingBot:
                 cancelled += 1
             except Exception:
                 continue
+        if cancelled < int(limit or 0):
+            try:
+                algo_orders = self._fetch_open_algo_orders(market_id)
+            except Exception:
+                algo_orders = []
+            for ao in (algo_orders or []):
+                if cancelled >= int(limit or 0):
+                    break
+                try:
+                    raw = ao or {}
+                    status = str(raw.get("algoStatus") or raw.get("status") or "").strip().upper()
+                    if status and status not in {"NEW"}:
+                        continue
+                    ot = str(raw.get("orderType") or raw.get("type") or "").strip().upper()
+                    if ("STOP" not in ot) and ("TAKE_PROFIT" not in ot) and ("TRAILING" not in ot):
+                        continue
+                    side = str(raw.get("side") or "").strip().upper()
+                    if ds and side and side != ds:
+                        continue
+                    if rps is not None:
+                        ps = str(raw.get("positionSide") or "").strip().upper()
+                        if ps and ps not in {rps, "BOTH"}:
+                            continue
+                    aid = raw.get("algoId")
+                    if aid is None:
+                        continue
+                    if self._cancel_algo_order(aid, market_id):
+                        cancelled += 1
+                except Exception:
+                    continue
         return cancelled
 
     def _raw_cancel_all_open_orders_for_symbol(self):
@@ -1479,6 +1534,126 @@ class GridTradingBot:
             except Exception:
                 return False
         return False
+
+    def _fapi_private_request(self, path: str, method: str, params: dict):
+        return self.exchange.request(path, "fapiPrivate", method, params or {})
+
+    def _fapi_private_call(self, method_names: list, request_path: str, http_method: str, params: dict):
+        for name in (method_names or []):
+            fn = getattr(self.exchange, str(name), None)
+            if callable(fn):
+                return fn(params or {})
+        if request_path:
+            return self._fapi_private_request(str(request_path), str(http_method).upper(), params or {})
+        raise AttributeError("No suitable fapiPrivate method")
+
+    def _fetch_open_algo_orders(self, market_id: str = None):
+        mid = str(market_id or "").strip() or self._raw_market_id()
+        if not mid:
+            return []
+        try:
+            res = self._fapi_private_call(
+                ["fapiPrivateGetOpenAlgoOrders", "fapiPrivateGetOpenalgoOrders", "fapiPrivateGetOpenAlgoOrder"],
+                "openAlgoOrders",
+                "GET",
+                {"symbol": mid},
+            )
+        except Exception:
+            return []
+        if isinstance(res, list):
+            return res
+        if isinstance(res, dict):
+            v = res.get("orders") or res.get("data")
+            if isinstance(v, list):
+                return v
+        return []
+
+    def _cancel_algo_order(self, algo_id, market_id: str = None) -> bool:
+        mid = str(market_id or "").strip() or self._raw_market_id()
+        if not mid:
+            return False
+        try:
+            aid = int(algo_id)
+        except Exception:
+            return False
+        try:
+            self._fapi_private_call(
+                ["fapiPrivateDeleteAlgoOrder", "fapiPrivateDeleteAlgoorder"],
+                "algoOrder",
+                "DELETE",
+                {"symbol": mid, "algoId": aid},
+            )
+            return True
+        except Exception:
+            return False
+
+    def _cancel_all_open_algo_orders(self, market_id: str = None) -> bool:
+        mid = str(market_id or "").strip() or self._raw_market_id()
+        if not mid:
+            return False
+        try:
+            self._fapi_private_call(
+                ["fapiPrivateDeleteAlgoOpenOrders", "fapiPrivateDeleteAlgoopenOrders"],
+                "algoOpenOrders",
+                "DELETE",
+                {"symbol": mid},
+            )
+            return True
+        except Exception:
+            return False
+
+    def _place_algo_conditional_order(
+        self,
+        order_type: str,
+        side: str,
+        trigger_price: float,
+        position_side: str = None,
+        close_position: bool = True,
+        quantity: float = None,
+        client_algo_id: str = None,
+    ):
+        mid = self._raw_market_id()
+        if not mid:
+            raise ValueError("missing market id")
+        ot = str(order_type or "").strip().upper()
+        if not ot:
+            raise ValueError("missing order type")
+        sd = str(side or "").strip().upper()
+        if sd not in {"BUY", "SELL"}:
+            raise ValueError("invalid side")
+        tp = self._safe_float(trigger_price)
+        if tp is None or float(tp) <= 0:
+            raise ValueError("invalid trigger price")
+        params = {
+            "symbol": mid,
+            "side": sd,
+            "algoType": "CONDITIONAL",
+            "orderType": ot,
+            "timeInForce": "GTC",
+            "triggerPrice": float(tp),
+            "price": float(tp),
+            "workingType": "CONTRACT_PRICE",
+            "priceProtect": False,
+        }
+        if client_algo_id:
+            params["clientAlgoId"] = str(client_algo_id)
+        if position_side is not None:
+            ps = str(position_side or "").strip().upper()
+            if ps in {"LONG", "SHORT", "BOTH"}:
+                params["positionSide"] = ps
+        if bool(close_position):
+            params["closePosition"] = True
+        else:
+            q = self._safe_float(quantity)
+            if q is None or q <= 0:
+                raise ValueError("invalid quantity")
+            params["quantity"] = float(q)
+        return self._fapi_private_call(
+            ["fapiPrivatePostAlgoOrder", "fapiPrivatePostAlgoorder"],
+            "algoOrder",
+            "POST",
+            params,
+        )
 
     def _compute_trailing_stop_price(self, side: str, entry_price: float, current_price: float, cfg: dict):
         s = str(side or "").strip().lower()
@@ -1600,6 +1775,7 @@ class GridTradingBot:
         if bool(getattr(self, "_hedge_mode", False)):
             required_ps = "LONG" if s == "long" else "SHORT"
 
+        market_id = self._raw_market_id()
         try:
             orders = self._get_open_orders_cached(max_age_sec=0.0) or []
         except Exception:
@@ -1621,7 +1797,39 @@ class GridTradingBot:
                 info = (o or {}).get("info") or {}
                 ex_stop = self._safe_float(info.get("stopPrice")) or self._safe_float(info.get("sp"))
                 ex_stop = round(float(ex_stop or 0.0), int(self.price_precision or 0))
-                candidates.append({"order": o, "stop": ex_stop})
+                candidates.append({"kind": "order", "order": o, "stop": ex_stop})
+            except Exception:
+                continue
+
+        algo_orders = []
+        try:
+            if market_id:
+                algo_orders = self._fetch_open_algo_orders(market_id)
+        except Exception:
+            algo_orders = []
+        for ao in (algo_orders or []):
+            try:
+                raw = ao or {}
+                status = str(raw.get("algoStatus") or raw.get("status") or "").strip().upper()
+                if status and status not in {"NEW"}:
+                    continue
+                ot = str(raw.get("orderType") or raw.get("type") or "").strip().upper()
+                if ("STOP" not in ot) and ("TAKE_PROFIT" not in ot) and ("TRAILING" not in ot):
+                    continue
+                a_side = str(raw.get("side") or "").strip().lower()
+                if a_side != desired_o_side:
+                    continue
+                if required_ps is not None:
+                    ps = str(raw.get("positionSide") or "").strip().upper()
+                    if ps and ps not in {required_ps, "BOTH"}:
+                        continue
+                ex_stop = self._safe_float(raw.get("triggerPrice"))
+                if ex_stop is None:
+                    ex_stop = self._safe_float(raw.get("stopPrice"))
+                if ex_stop is None:
+                    ex_stop = self._safe_float(raw.get("price"))
+                ex_stop = round(float(ex_stop or 0.0), int(self.price_precision or 0))
+                candidates.append({"kind": "algo", "algo": raw, "stop": ex_stop})
             except Exception:
                 continue
 
@@ -1636,19 +1844,27 @@ class GridTradingBot:
                 if cancelled >= 60:
                     break
                 try:
-                    oid = (it.get("order") or {}).get("id")
-                    if oid:
-                        self.cancel_order(oid)
-                        cancelled += 1
+                    if str(it.get("kind") or "") == "algo":
+                        aid = (it.get("algo") or {}).get("algoId")
+                        if aid is not None and self._cancel_algo_order(aid, market_id):
+                            cancelled += 1
+                    else:
+                        oid = (it.get("order") or {}).get("id")
+                        if oid:
+                            self.cancel_order(oid)
+                            cancelled += 1
                 except Exception:
                     continue
 
-        if bool(getattr(self, "_hedge_mode", False)) and required_ps is not None:
-            params = {"stopPrice": float(sp), "closePosition": True, "positionSide": required_ps}
-        else:
-            params = {"stopPrice": float(sp), "closePosition": True}
         try:
-            self.exchange.create_order(self.ccxt_symbol, "STOP_MARKET", desired_o_side, float(q), None, params)
+            algo_side = "SELL" if desired_o_side == "sell" else "BUY"
+            self._place_algo_conditional_order(
+                "STOP_MARKET",
+                algo_side,
+                float(sp),
+                position_side=(required_ps if bool(getattr(self, "_hedge_mode", False)) else None),
+                close_position=True,
+            )
             self._refresh_open_orders_cache()
             return "ok"
         except Exception as e:
@@ -1671,9 +1887,14 @@ class GridTradingBot:
                     retry_stop = round(float(retry_stop), int(self.price_precision or 0))
                     if retry_stop <= 0:
                         return "immediate_trigger"
-                    retry_params = dict(params or {})
-                    retry_params["stopPrice"] = float(retry_stop)
-                    self.exchange.create_order(self.ccxt_symbol, "STOP_MARKET", desired_o_side, float(q), None, retry_params)
+                    algo_side = "SELL" if desired_o_side == "sell" else "BUY"
+                    self._place_algo_conditional_order(
+                        "STOP_MARKET",
+                        algo_side,
+                        float(retry_stop),
+                        position_side=(required_ps if bool(getattr(self, "_hedge_mode", False)) else None),
+                        close_position=True,
+                    )
                     self._refresh_open_orders_cache()
                     return "ok"
                 except Exception:
@@ -1696,7 +1917,14 @@ class GridTradingBot:
                 except Exception:
                     pass
                 try:
-                    self.exchange.create_order(self.ccxt_symbol, "STOP_MARKET", desired_o_side, float(q), None, params)
+                    algo_side = "SELL" if desired_o_side == "sell" else "BUY"
+                    self._place_algo_conditional_order(
+                        "STOP_MARKET",
+                        algo_side,
+                        float(sp),
+                        position_side=(required_ps if bool(getattr(self, "_hedge_mode", False)) else None),
+                        close_position=True,
+                    )
                     self._refresh_open_orders_cache()
                     return "ok"
                 except Exception as e2:
@@ -1719,9 +1947,14 @@ class GridTradingBot:
                             retry_stop = round(float(retry_stop), int(self.price_precision or 0))
                             if retry_stop <= 0:
                                 return "immediate_trigger"
-                            retry_params = dict(params or {})
-                            retry_params["stopPrice"] = float(retry_stop)
-                            self.exchange.create_order(self.ccxt_symbol, "STOP_MARKET", desired_o_side, float(q), None, retry_params)
+                            algo_side = "SELL" if desired_o_side == "sell" else "BUY"
+                            self._place_algo_conditional_order(
+                                "STOP_MARKET",
+                                algo_side,
+                                float(retry_stop),
+                                position_side=(required_ps if bool(getattr(self, "_hedge_mode", False)) else None),
+                                close_position=True,
+                            )
                             self._refresh_open_orders_cache()
                             return "ok"
                         except Exception:
@@ -2235,6 +2468,8 @@ class GridTradingBot:
                             await self.handle_ticker_update(message)
                         elif data.get("e") == "ORDER_TRADE_UPDATE":
                             await self.handle_order_update(message)
+                        elif data.get("e") == "ALGO_UPDATE":
+                            await self.handle_algo_update(message)
                     except Exception as e:
                         if self.shutdown_event.is_set():
                             break
@@ -2499,6 +2734,79 @@ class GridTradingBot:
 
         if need_eval:
             self._kick_risk_eval()
+
+    async def _maybe_shutdown_after_algo_event(self, closed_side: str, reason: str):
+        if self.shutdown_event.is_set():
+            return
+        s = str(closed_side or "").strip().lower()
+        if s not in {"long", "short"}:
+            return
+        r = str(reason or "").strip().lower()
+        if not r:
+            r = "hard_stoploss"
+        try:
+            await asyncio.sleep(0.25)
+        except Exception:
+            pass
+        if self.shutdown_event.is_set():
+            return
+        pos = None
+        try:
+            if s == "long":
+                pos = float(self.long_position or 0.0)
+            else:
+                pos = float(self.short_position or 0.0)
+        except Exception:
+            pos = None
+        if pos is None:
+            try:
+                snap = self.get_position_snapshot()
+                pos = float(((snap.get(s) or {}).get("amt") or 0.0))
+            except Exception:
+                pos = None
+        if pos is None:
+            return
+        if float(pos or 0.0) > 0:
+            try:
+                snap = self.get_position_snapshot()
+                pos2 = float(((snap.get(s) or {}).get("amt") or 0.0))
+                if float(pos2 or 0.0) > 0:
+                    return
+            except Exception:
+                return
+        try:
+            await self.shutdown(r)
+        except Exception:
+            pass
+
+    async def handle_algo_update(self, message):
+        async with self.lock:
+            data = json.loads(message)
+            if data.get("e") != "ALGO_UPDATE":
+                return
+            order = data.get("o") or {}
+            symbol = str(order.get("s") or "").strip().upper()
+            if symbol != f"{self.coin_name}{self.contract_type}":
+                return
+            ot = str(order.get("o") or "").strip().upper()
+            if ("STOP" not in ot) and ("TAKE_PROFIT" not in ot) and ("TRAILING" not in ot):
+                return
+            close_position = _parse_env_bool(order.get("cp"), False)
+            reduce_only = _parse_env_bool(order.get("R"), False)
+            if (not close_position) and (not reduce_only):
+                return
+            status = str(order.get("X") or "").strip().upper()
+            actual_order_id = str(order.get("ai") or "").strip()
+            aq = self._safe_float(order.get("aq")) or 0.0
+            if (not actual_order_id) and float(aq or 0.0) <= 0 and status not in {"TRIGGERED", "EXECUTED", "FINISHED", "FILLED"}:
+                return
+            side = str(order.get("S") or "").strip().upper()
+            if side not in {"BUY", "SELL"}:
+                return
+            closed_side = "long" if side == "SELL" else "short"
+            reason = "take_profit" if "TAKE_PROFIT" in ot else "hard_stoploss"
+        if not self.shutdown_event.is_set():
+            asyncio.create_task(self._maybe_shutdown_after_algo_event(closed_side, reason))
 
     def _kick_risk_eval(self):
         task = getattr(self, "_order_event_eval_task", None)
