@@ -1624,10 +1624,20 @@ class GridTradingBot:
         tp = self._safe_float(trigger_price)
         if tp is None or float(tp) <= 0:
             raise ValueError("invalid trigger price")
+        binance_type = None
+        if ot in {"STOP_MARKET", "STOP"}:
+            binance_type = "STOP"
+        elif ot in {"TAKE_PROFIT_MARKET", "TAKE_PROFIT"}:
+            binance_type = "TAKE_PROFIT"
+        elif ot in {"TRAILING_STOP_MARKET"}:
+            binance_type = "TRAILING_STOP_MARKET"
+        else:
+            binance_type = ot
         params = {
             "symbol": mid,
             "side": sd,
             "algoType": "CONDITIONAL",
+            "type": str(binance_type),
             "orderType": ot,
             "timeInForce": "GTC",
             "triggerPrice": float(tp),
@@ -1858,6 +1868,7 @@ class GridTradingBot:
 
         try:
             algo_side = "SELL" if desired_o_side == "sell" else "BUY"
+            algo_debug = f"algoOrder type=STOP side={algo_side} triggerPrice={float(sp)} positionSide={required_ps if bool(getattr(self, '_hedge_mode', False)) else None} closePosition=True"
             self._place_algo_conditional_order(
                 "STOP_MARKET",
                 algo_side,
@@ -1888,6 +1899,7 @@ class GridTradingBot:
                     if retry_stop <= 0:
                         return "immediate_trigger"
                     algo_side = "SELL" if desired_o_side == "sell" else "BUY"
+                    algo_debug_retry = f"algoOrder type=STOP side={algo_side} triggerPrice={float(retry_stop)} positionSide={required_ps if bool(getattr(self, '_hedge_mode', False)) else None} closePosition=True"
                     self._place_algo_conditional_order(
                         "STOP_MARKET",
                         algo_side,
@@ -1918,6 +1930,7 @@ class GridTradingBot:
                     pass
                 try:
                     algo_side = "SELL" if desired_o_side == "sell" else "BUY"
+                    algo_debug_4045 = f"algoOrder type=STOP side={algo_side} triggerPrice={float(sp)} positionSide={required_ps if bool(getattr(self, '_hedge_mode', False)) else None} closePosition=True"
                     self._place_algo_conditional_order(
                         "STOP_MARKET",
                         algo_side,
@@ -1948,6 +1961,7 @@ class GridTradingBot:
                             if retry_stop <= 0:
                                 return "immediate_trigger"
                             algo_side = "SELL" if desired_o_side == "sell" else "BUY"
+                            algo_debug_4045_retry = f"algoOrder type=STOP side={algo_side} triggerPrice={float(retry_stop)} positionSide={required_ps if bool(getattr(self, '_hedge_mode', False)) else None} closePosition=True"
                             self._place_algo_conditional_order(
                                 "STOP_MARKET",
                                 algo_side,
@@ -1959,9 +1973,15 @@ class GridTradingBot:
                             return "ok"
                         except Exception:
                             return "immediate_trigger"
-                    logger.error(f"更新止损单失败: {e2}")
+                    try:
+                        logger.error(f"更新止损单失败: {e2} ({algo_debug_4045})")
+                    except Exception:
+                        pass
             else:
-                logger.error(f"更新止损单失败: {e}")
+                try:
+                    logger.error(f"更新止损单失败: {e} ({algo_debug})")
+                except Exception:
+                    pass
         self._refresh_open_orders_cache()
         return "error"
 
