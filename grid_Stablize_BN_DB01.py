@@ -1624,15 +1624,7 @@ class GridTradingBot:
         tp = self._safe_float(trigger_price)
         if tp is None or float(tp) <= 0:
             raise ValueError("invalid trigger price")
-        binance_type = None
-        if ot in {"STOP_MARKET", "STOP"}:
-            binance_type = "STOP"
-        elif ot in {"TAKE_PROFIT_MARKET", "TAKE_PROFIT"}:
-            binance_type = "TAKE_PROFIT"
-        elif ot in {"TRAILING_STOP_MARKET"}:
-            binance_type = "TRAILING_STOP_MARKET"
-        else:
-            binance_type = ot
+        binance_type = ot
         params = {
             "symbol": mid,
             "side": sd,
