@@ -2414,6 +2414,8 @@ class GridTradingBot:
             cfg = self.risk_engine.get_config() or {}
         except Exception:
             cfg = {}
+        if self._pending_entry_enabled(cfg) and self._pending_entry_price(cfg) is not None:
+            return
         grid_enabled = bool(cfg.get("GRID_ENABLED", True))
         if grid_enabled and (not bool(cfg.get("ENABLE_BASE_POSITION", False))):
             return
@@ -3058,6 +3060,152 @@ class GridTradingBot:
             logger.error(f"下单报错: {e}")
             return None
 
+    def _pending_entry_enabled(self, cfg: dict) -> bool:
+        try:
+            return bool((cfg or {}).get("PENDING_ENTRY_ENABLED", False))
+        except Exception:
+            return False
+
+    def _pending_entry_price(self, cfg: dict):
+        try:
+            p = self._safe_float((cfg or {}).get("PENDING_ENTRY_PRICE", 0.0))
+            if p is None or float(p) <= 0:
+                return None
+            return float(p)
+        except Exception:
+            return None
+
+    def _maybe_ensure_pending_entry_order_locked(self, cfg: dict) -> bool:
+        if not self._pending_entry_enabled(cfg):
+            return False
+        pending_price = self._pending_entry_price(cfg)
+        if pending_price is None:
+            return False
+        active_side = str(self.direction or "long").strip().lower()
+        if active_side not in {"long", "short"}:
+            active_side = "long"
+
+        pos = float(self.long_position or 0.0) if active_side == "long" else float(self.short_position or 0.0)
+        if pos <= 0:
+            try:
+                lp, sp = self.get_position()
+                self.long_position, self.short_position = lp, sp
+                pos = float(lp or 0.0) if active_side == "long" else float(sp or 0.0)
+            except Exception:
+                pass
+        if pos > 0:
+            try:
+                orders = self._get_open_orders_cached(max_age_sec=0.0) or []
+            except Exception:
+                orders = []
+            desired_id = None
+            try:
+                desired_id = self.risk_engine._pending_entry_client_id(active_side, pending_price)
+            except Exception:
+                desired_id = None
+            if desired_id:
+                for o in orders:
+                    try:
+                        if self._is_stop_order(o):
+                            continue
+                        if self._get_order_reduce_only(o):
+                            continue
+                        if str(self._get_order_client_id(o) or "") != str(desired_id):
+                            continue
+                        oid = (o or {}).get("id")
+                        if oid:
+                            self.cancel_order(oid)
+                    except Exception:
+                        continue
+            return False
+
+        entry_side = "buy" if active_side == "long" else "sell"
+        base_usdc = None
+        if bool((cfg or {}).get("ENABLE_BASE_POSITION", False)):
+            base_usdc = self._safe_float((cfg or {}).get("BASE_POSITION_USDC", 0.0))
+        if base_usdc is None or float(base_usdc) <= 0:
+            base_usdc = self._safe_float((cfg or {}).get("BASE_ORDER_SIZE_USDC", 0.0))
+        if base_usdc is None or float(base_usdc) <= 0:
+            return True
+
+        qty = self.usdc_to_amount(float(base_usdc), float(pending_price))
+        if qty is None or float(qty) <= 0:
+            return True
+
+        try:
+            orders = self._get_open_orders_cached(max_age_sec=0.0) or []
+        except Exception:
+            orders = []
+        desired_id = None
+        try:
+            desired_id = self.risk_engine._pending_entry_client_id(active_side, pending_price)
+        except Exception:
+            desired_id = None
+        desired_price = round(float(pending_price), int(self.price_precision or 0))
+
+        for o in orders:
+            try:
+                if self._is_stop_order(o):
+                    continue
+                if self._get_order_reduce_only(o):
+                    continue
+                o_side = str((o or {}).get("side") or "").strip().lower()
+                if o_side != entry_side:
+                    continue
+                ps = self._get_order_position_side(o)
+                if bool(getattr(self, "_hedge_mode", False)):
+                    required_ps = "LONG" if active_side == "long" else "SHORT"
+                    if ps != required_ps:
+                        continue
+                o_price = self._safe_float((o or {}).get("price"))
+                if o_price is None:
+                    o_price = self._safe_float(((o or {}).get("info") or {}).get("price"))
+                if o_price is None or float(o_price) <= 0:
+                    continue
+                o_price = round(float(o_price), int(self.price_precision or 0))
+                cid = str(self._get_order_client_id(o) or "")
+                if desired_id and cid == str(desired_id) and o_price == desired_price:
+                    return True
+            except Exception:
+                continue
+
+        for o in orders:
+            try:
+                if self._is_stop_order(o):
+                    continue
+                if self._get_order_reduce_only(o):
+                    continue
+                o_side = str((o or {}).get("side") or "").strip().lower()
+                if o_side != entry_side:
+                    continue
+                ps = self._get_order_position_side(o)
+                if bool(getattr(self, "_hedge_mode", False)):
+                    required_ps = "LONG" if active_side == "long" else "SHORT"
+                    if ps != required_ps:
+                        continue
+                cid = str(self._get_order_client_id(o) or "")
+                if desired_id and cid == str(desired_id):
+                    continue
+                oid = (o or {}).get("id")
+                if oid:
+                    self.cancel_order(oid)
+            except Exception:
+                continue
+
+        o = self.place_order(
+            entry_side,
+            price=float(pending_price),
+            quantity=float(qty),
+            is_reduce_only=False,
+            position_side=active_side,
+            order_type="limit",
+            client_order_id=desired_id,
+        )
+        if o is not None:
+            logger.info(f"挂单入场已下单: {active_side} {entry_side} @ {desired_price}")
+        self._refresh_open_orders_cache()
+        return True
+
     # ==================== 策略逻辑 ====================
     async def adjust_grid_strategy(self):
 
@@ -3080,6 +3228,9 @@ class GridTradingBot:
 
         async with self.lock:
             if bool(getattr(self, "is_grid_stopped", False)):
+                return
+            if self._maybe_ensure_pending_entry_order_locked(cfg):
+                self._force_orders_resync = False
                 return
             if not grid_enabled:
                 try:

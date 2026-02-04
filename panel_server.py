@@ -127,6 +127,7 @@ def _editable_view(cfg: dict) -> dict:
     hs = cfg.get("硬止损") if isinstance(cfg.get("硬止损"), dict) else {}
     ts = cfg.get("移动硬止损") if isinstance(cfg.get("移动硬止损"), dict) else {}
     tp = cfg.get("止盈") if isinstance(cfg.get("止盈"), dict) else {}
+    pe = cfg.get("挂单") if isinstance(cfg.get("挂单"), dict) else {}
     inst = cfg.get("实例") if isinstance(cfg.get("实例"), dict) else {}
     pair = cfg.get("交易对") if isinstance(cfg.get("交易对"), dict) else {}
     margin_mode = str(cfg.get("保证金模式") or "").strip()
@@ -166,6 +167,7 @@ def _editable_view(cfg: dict) -> dict:
             "启用": _parse_bool(tp.get("启用"), False),
             "价格": (tp.get("价格") if _parse_bool(tp.get("启用"), False) else None),
         },
+        "挂单": {"启用": _parse_bool(pe.get("启用"), False), "价格": pe.get("价格")},
     }
 
 
@@ -256,6 +258,20 @@ def _apply_update(cfg: dict, update: dict) -> dict:
     if tp.get("启用") is False:
         tp.pop("价格", None)
     out["止盈"] = tp
+
+    pe = out.get("挂单") if isinstance(out.get("挂单"), dict) else {}
+    up_pe = update.get("挂单") or {}
+    if "启用" in up_pe:
+        pe["启用"] = _parse_bool(up_pe.get("启用"), False)
+    if "价格" in up_pe:
+        v = up_pe.get("价格")
+        if v is None or str(v).strip() == "":
+            pe.pop("价格", None)
+        else:
+            pe["价格"] = float(v)
+    if pe.get("启用") is False:
+        pe.pop("价格", None)
+    out["挂单"] = pe
 
     return out
 
@@ -403,6 +419,8 @@ async function loadConfigIntoCard(id, force){
   c.tsBase.value = ((cfg['移动硬止损']||{})['初始止损比例'] ?? '');
   c.tpEnable.value = (((cfg['止盈']||{})['启用']===true))?'true':'false';
   c.tpPrice.value = ((cfg['止盈']||{})['价格'] ?? '');
+  c.pendingEnable.value = (((cfg['挂单']||{})['启用']===true))?'true':'false';
+  c.pendingPrice.value = ((cfg['挂单']||{})['价格'] ?? '');
   const ladder = ((cfg['移动硬止损']||{})['阶梯'] || []);
   const pbLadder = ((cfg['移动硬止损']||{})['回撤阶梯'] || []);
   c.ladderRows = [];
@@ -484,6 +502,8 @@ function ensureCard(slot){
   const tsBase = el('input');
   const tpEnable = el('select'); tpEnable.innerHTML = `<option value="false">否</option><option value="true">是</option>`;
   const tpPrice = el('input');
+  const pendingEnable = el('select'); pendingEnable.innerHTML = `<option value="false">否</option><option value="true">是</option>`;
+  const pendingPrice = el('input');
   const ladderWrap = el('div');
   const ladderRowsEl = el('div');
   const ladderAddBtn = el('button', {html:'添加阶梯'});
@@ -516,6 +536,8 @@ function ensureCard(slot){
   form.appendChild(el('div',{html:'跟踪回撤阶梯'})); form.appendChild(pbWrap);
   form.appendChild(el('div',{html:'止盈启用'})); form.appendChild(tpEnable);
   form.appendChild(el('div',{html:'止盈价格'})); form.appendChild(tpPrice);
+  form.appendChild(el('div',{html:'启动挂单'})); form.appendChild(pendingEnable);
+  form.appendChild(el('div',{html:'挂单价格'})); form.appendChild(pendingPrice);
   card.appendChild(levList);
   card.appendChild(form);
 
@@ -536,7 +558,7 @@ function ensureCard(slot){
     n.addEventListener('input', ()=>markDirty(slot.id));
     n.addEventListener('change', ()=>markDirty(slot.id));
   }
-  [coin,quote,gridEnable,dir,mode,marginMode,spacing,money,leverage,maker,alloc,baseEnable,baseAmount,hard,tsEnable,tsBase,tpEnable,tpPrice].forEach(bindDirty);
+  [coin,quote,gridEnable,dir,mode,marginMode,spacing,money,leverage,maker,alloc,baseEnable,baseAmount,hard,tsEnable,tsBase,tpEnable,tpPrice,pendingEnable,pendingPrice].forEach(bindDirty);
 
   function addLadderRow(trigger, stop){
     const row = el('div', {class:'ladder-row'});
@@ -600,7 +622,8 @@ function ensureCard(slot){
           "底仓": {"启用": (baseEnable.value==='true'), "金额": baseAmount.value},
           "硬止损": {"价格": hard.value},
           "移动硬止损": {"启用": (tsEnable.value==='true'), "初始止损比例": tsBase.value, "阶梯": ladder, "回撤阶梯": pb},
-          "止盈": {"启用": (tpEnable.value==='true'), "价格": toNumOrNull(tpPrice.value)}
+          "止盈": {"启用": (tpEnable.value==='true'), "价格": toNumOrNull(tpPrice.value)},
+          "挂单": {"启用": (pendingEnable.value==='true'), "价格": toNumOrNull(pendingPrice.value)}
         })});
         clearDirty(slot.id);
         await refreshSlotsOnce();
@@ -615,7 +638,7 @@ function ensureCard(slot){
   refreshBtn.onclick = async ()=>{ await withPending(refreshBtn, async ()=>{ try{ await loadConfigIntoCard(slot.id, true); await resetStatusIfOfflineOrStopped(slot.id); await refreshSlotsOnce(); }catch(e){ alert(e && e.message ? e.message : String(e)); } }); };
 
   root.appendChild(card);
-  const entry = {id:slot.id, card, badge, state, stSymbol, stDir, stMode, stErr, stEquity, stPnl, stDd, stNotional, dirtyEl, mode, marginMode, coin, quote, gridEnable, dir, spacing, money, leverage, maker, alloc, baseEnable, baseAmount, hard, tsEnable, tsBase, tpEnable, tpPrice, ladderRowsEl, ladderRows: [], addLadderRow, pbRowsEl, pbRows: [], addPbRow, dirty:false};
+  const entry = {id:slot.id, card, badge, state, stSymbol, stDir, stMode, stErr, stEquity, stPnl, stDd, stNotional, dirtyEl, mode, marginMode, coin, quote, gridEnable, dir, spacing, money, leverage, maker, alloc, baseEnable, baseAmount, hard, tsEnable, tsBase, tpEnable, tpPrice, pendingEnable, pendingPrice, ladderRowsEl, ladderRows: [], addLadderRow, pbRowsEl, pbRows: [], addPbRow, dirty:false};
   cards.set(slot.id, entry);
   loadConfigIntoCard(slot.id, false).catch(()=>{});
   return entry;

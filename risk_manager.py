@@ -44,6 +44,8 @@ class RiskEngine:
             "TRAILING_STOP_BASE_STOP_RATIO": 0.0,
             "TRAILING_STOP_LADDER": [],
             "TRAILING_PULLBACK_LADDER": [],
+            "PENDING_ENTRY_ENABLED": False,
+            "PENDING_ENTRY_PRICE": 0.0,
             "ORDER_CLIENT_ID_PREFIX": "AF",
             "HOT_RELOAD_ENABLED": True,
             "CONFIG_WATCH_INTERVAL_SEC": 1.0,
@@ -161,6 +163,13 @@ class RiskEngine:
                 out["TRAILING_STOP_LADDER"] = trailing.get("阶梯")
             if "回撤阶梯" in trailing:
                 out["TRAILING_PULLBACK_LADDER"] = trailing.get("回撤阶梯")
+
+        pe = raw.get("挂单")
+        if isinstance(pe, dict):
+            if "启用" in pe:
+                out["PENDING_ENTRY_ENABLED"] = pe.get("启用")
+            if "价格" in pe:
+                out["PENDING_ENTRY_PRICE"] = pe.get("价格")
 
         account_mode = raw.get("账户模式") or raw.get("交易环境") or raw.get("ACCOUNT_MODE") or raw.get("account_mode") or raw.get("环境")
         if account_mode is not None and "账户模式" in raw:
@@ -287,6 +296,12 @@ class RiskEngine:
         norm_pb.sort(key=lambda x: float(x["trigger_ratio"]))
         cfg["TRAILING_PULLBACK_LADDER"] = norm_pb
 
+        cfg["PENDING_ENTRY_ENABLED"] = bool(cfg.get("PENDING_ENTRY_ENABLED", False))
+        pe_price = float(cfg.get("PENDING_ENTRY_PRICE", 0.0) or 0.0)
+        if cfg["PENDING_ENTRY_ENABLED"] and pe_price <= 0:
+            raise ValueError("挂单启用时，挂单价格必须 > 0")
+        cfg["PENDING_ENTRY_PRICE"] = float(pe_price)
+
         cfg["HOT_RELOAD_ENABLED"] = bool(cfg.get("HOT_RELOAD_ENABLED", True))
         watch_itv = float(cfg.get("CONFIG_WATCH_INTERVAL_SEC", 1.0))
         if watch_itv <= 0:
@@ -368,6 +383,15 @@ class RiskEngine:
         role_ch = "A" if r == "add" else "T"
         return f"{prefix}{side_ch}{role_ch}{digest}"
 
+    def _pending_entry_client_id(self, side: str, pending_price: float) -> str:
+        prefix = str(self.get_config().get("ORDER_CLIENT_ID_PREFIX", "AF")).strip() or "AF"
+        s = str(side or "").strip().lower()
+        p = float(pending_price or 0.0)
+        base = f"pending|{s}|{p:.8f}"
+        digest = hashlib.md5(base.encode("utf-8")).hexdigest()[:12]
+        side_ch = "L" if s == "long" else "S"
+        return f"{prefix}{side_ch}P{digest}"
+
     def side_plan(self, side: str, price: float, position_amount: float) -> dict:
         cfg = self.get_config()
         p = float(price or 0.0)
@@ -390,6 +414,15 @@ class RiskEngine:
             add_price = p * (1.0 + add_spacing)
             tp_price = p * (1.0 - tp_spacing)
 
+        pending_enabled = bool(cfg.get("PENDING_ENTRY_ENABLED", False))
+        pending_price = float(cfg.get("PENDING_ENTRY_PRICE", 0.0) or 0.0)
+        if pending_enabled and pending_price > 0 and pos <= 0:
+            add_price = float(pending_price)
+            if bool(cfg.get("ENABLE_BASE_POSITION", False)):
+                base_pos_usdc = float(cfg.get("BASE_POSITION_USDC", 0.0) or 0.0)
+                if base_pos_usdc > 0:
+                    add_usdc = float(base_pos_usdc)
+
         add_qty = self.bot.usdc_to_amount(add_usdc, add_price)
         tp_qty = self.bot.usdc_to_amount(tp_usdc, tp_price)
         if pos > 0 and tp_qty is not None:
@@ -407,7 +440,11 @@ class RiskEngine:
                 "qty": add_qty,
                 "spacing": float(add_spacing),
                 "size_usdc": float(add_usdc),
-                "client_id": self._client_id(s, "add", add_spacing, add_usdc, tp_spacing, tp_usdc),
+                "client_id": (
+                    self._pending_entry_client_id(s, pending_price)
+                    if (pending_enabled and pending_price > 0 and pos <= 0)
+                    else self._client_id(s, "add", add_spacing, add_usdc, tp_spacing, tp_usdc)
+                ),
             },
             "tp": {
                 "price": float(tp_price),
