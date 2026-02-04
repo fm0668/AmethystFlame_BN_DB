@@ -433,6 +433,14 @@ class GridTradingBot:
         if self.shutdown_event.is_set():
             s, _ = _ui_state_for_shutdown_reason(getattr(self, "_shutdown_reason", None))
             state = s or "shutdown"
+        else:
+            try:
+                pending_enabled = bool(cfg.get("PENDING_ENTRY_ENABLED", False))
+                pending_price = self._pending_entry_price(cfg)
+                if pending_enabled and pending_price is not None and float(pos_amt or 0.0) <= 0:
+                    state = "pending_entry"
+            except Exception:
+                pass
 
         stop_price = None
         try:

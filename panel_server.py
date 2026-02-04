@@ -341,6 +341,7 @@ function stateCN(state){
   const s = String(state||'').trim().toLowerCase();
   if(!s) return '';
   if(s==='running') return '运行中';
+  if(s==='pending_entry') return '挂单中';
   if(s==='stopped') return '已停止';
   if(s==='shutdown') return '已退出';
   if(s==='hard_stoploss') return '已止损';
