@@ -392,6 +392,16 @@ class RiskEngine:
         side_ch = "L" if s == "long" else "S"
         return f"{prefix}{side_ch}P{digest}"
 
+    def _pending_hardstop_client_id(self, side: str, pending_price: float, hard_stop_price: float) -> str:
+        prefix = str(self.get_config().get("ORDER_CLIENT_ID_PREFIX", "AF")).strip() or "AF"
+        s = str(side or "").strip().lower()
+        pp = float(pending_price or 0.0)
+        sp = float(hard_stop_price or 0.0)
+        base = f"pending_hardstop|{s}|{pp:.8f}|{sp:.8f}"
+        digest = hashlib.md5(base.encode("utf-8")).hexdigest()[:12]
+        side_ch = "L" if s == "long" else "S"
+        return f"{prefix}{side_ch}H{digest}"
+
     def side_plan(self, side: str, price: float, position_amount: float) -> dict:
         cfg = self.get_config()
         p = float(price or 0.0)

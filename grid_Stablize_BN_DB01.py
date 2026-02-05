@@ -11,6 +11,7 @@ import os
 import asyncio
 import uuid
 import signal
+import re
 
 from risk_manager import RiskEngine
 
@@ -298,6 +299,9 @@ class GridTradingBot:
         self._status_file_path = os.path.join(self._status_dir, f"{self.instance_id}.json")
         self._stop_flag_path = os.path.join(self._status_dir, f"{self.instance_id}.stop")
         self._last_ws_msg_ts = 0.0
+        self._rest_ban_until_ts = 0.0
+        self._rest_next_allowed_ts = 0.0
+        self._rest_backoff_sec = 0.0
         self._strategy_config_version = 0
         self._force_orders_resync = True
         self.direction = None
@@ -770,6 +774,46 @@ class GridTradingBot:
             pass
         return True
 
+    def _extract_rest_ban_until_ts(self, err) -> float:
+        s = str(err or "")
+        m = re.search(r"banned until\s+(\d+)", s, flags=re.IGNORECASE)
+        if not m:
+            return 0.0
+        try:
+            ms = int(m.group(1))
+        except Exception:
+            return 0.0
+        if ms <= 0:
+            return 0.0
+        return float(ms) / 1000.0
+
+    def _rest_allowed(self) -> bool:
+        now = time.time()
+        if float(self._rest_ban_until_ts or 0.0) > 0 and now < float(self._rest_ban_until_ts):
+            return False
+        if float(self._rest_next_allowed_ts or 0.0) > 0 and now < float(self._rest_next_allowed_ts):
+            return False
+        return True
+
+    def _note_rest_error(self, err, label: str = "rest") -> None:
+        now = time.time()
+        ban_until = self._extract_rest_ban_until_ts(err)
+        if ban_until > 0:
+            self._rest_ban_until_ts = max(float(self._rest_ban_until_ts or 0.0), float(ban_until))
+            self._rest_next_allowed_ts = max(float(self._rest_next_allowed_ts or 0.0), float(ban_until))
+            if self._err_rate_limit("rest_banned", 10.0):
+                self._set_last_error(f"REST 被限流/封禁，已进入等待恢复：{err}")
+            return
+        backoff = float(self._rest_backoff_sec or 0.0)
+        if backoff <= 0:
+            backoff = 5.0
+        else:
+            backoff = min(120.0, max(5.0, backoff * 2.0))
+        self._rest_backoff_sec = float(backoff)
+        self._rest_next_allowed_ts = float(now) + float(backoff)
+        if self._err_rate_limit(f"rest_err_{label}", 10.0):
+            self._set_last_error(f"REST 请求失败，已进入退避({int(backoff)}s)：{err}")
+
     def round_amount(self, quantity: float):
         q = self._safe_float(quantity)
         if q is None:
@@ -961,12 +1005,19 @@ class GridTradingBot:
         ts = float(getattr(self, "_open_orders_cache_ts", 0.0) or 0.0)
         if cached is not None and (now - ts) <= float(max_age_sec or 0.0):
             return cached
+        if not self._rest_allowed():
+            if cached is not None:
+                return cached
+            return []
         orders = self.exchange.fetch_open_orders(self.ccxt_symbol)
         self._open_orders_cache = orders
         self._open_orders_cache_ts = now
         return orders
 
     def _refresh_open_orders_cache(self):
+        if not self._rest_allowed():
+            self._open_orders_cache_ts = time.time()
+            return
         try:
             orders = self.exchange.fetch_open_orders(self.ccxt_symbol)
             self._open_orders_cache = orders
@@ -1376,10 +1427,16 @@ class GridTradingBot:
                 out["short"]["entry_price"] = entry
         return out
 
-    def _cancel_stop_orders_for_side(self, side: str):
+    def _cancel_stop_orders_for_side(self, side: str, keep_client_ids=None):
         s = str(side or "").strip().lower()
         if s not in {"long", "short"}:
             return
+        keep = set()
+        try:
+            if keep_client_ids:
+                keep = {str(x) for x in (keep_client_ids or []) if str(x)}
+        except Exception:
+            keep = set()
         required_ps = None
         if bool(getattr(self, "_hedge_mode", False)):
             required_ps = "LONG" if s == "long" else "SHORT"
@@ -1393,6 +1450,10 @@ class GridTradingBot:
                     continue
                 if not self._get_order_reduce_only(o):
                     continue
+                if keep:
+                    cid = str(self._get_order_client_id(o) or "")
+                    if cid and cid in keep:
+                        continue
                 if required_ps is not None:
                     ps = self._get_order_position_side(o)
                     if ps != required_ps:
@@ -1418,6 +1479,10 @@ class GridTradingBot:
                     a_side = str(raw.get("side") or "").strip().lower()
                     if a_side != desired_o_side:
                         continue
+                    if keep:
+                        cid = str(raw.get("clientAlgoId") or raw.get("clientOrderId") or raw.get("clientOrderID") or "").strip()
+                        if cid and cid in keep:
+                            continue
                     if required_ps is not None:
                         ps = str(raw.get("positionSide") or "").strip().upper()
                         if ps and ps not in {required_ps, "BOTH"}:
@@ -2003,6 +2068,8 @@ class GridTradingBot:
         self._apply_runtime_settings_from_config()
         if not bool(cfg.get("TRAILING_STOP_ENABLED", False)):
             return
+        if not self._rest_allowed():
+            return
         if self.latest_price is None or float(self.latest_price or 0.0) <= 0:
             return
         side = str(self.direction or "long").strip().lower()
@@ -2023,8 +2090,19 @@ class GridTradingBot:
                 self._trail_trough_price_short = None
                 self._trail_anchor_entry_short = None
                 self._trail_stop_price_short = None
+            keep = set()
+            try:
+                if self._pending_entry_enabled(cfg):
+                    pp = self._pending_entry_price(cfg)
+                    hs = self._safe_float(cfg.get("HARD_STOPLOSS_PRICE", 0.0))
+                    if pp is not None and hs is not None and float(hs) > 0:
+                        cid = self._pending_hardstop_client_id(side, float(pp), float(hs))
+                        if cid:
+                            keep.add(str(cid))
+            except Exception:
+                keep = set()
             async with self.lock:
-                self._cancel_stop_orders_for_side(side)
+                self._cancel_stop_orders_for_side(side, keep_client_ids=keep)
             return
         stop_price = self._compute_trailing_stop_price(side, float(entry), float(self.latest_price), cfg)
         if stop_price is None:
@@ -2057,6 +2135,8 @@ class GridTradingBot:
         self._apply_runtime_settings_from_config()
         hs_price = self._safe_float(cfg.get("HARD_STOPLOSS_PRICE", 0.0))
         if hs_price is None or hs_price <= 0:
+            return
+        if not self._rest_allowed():
             return
         if float(self.latest_price or 0.0) <= 0:
             return
@@ -2505,11 +2585,22 @@ class GridTradingBot:
                             await self.handle_order_update(message)
                         elif data.get("e") == "ALGO_UPDATE":
                             await self.handle_algo_update(message)
+                    except json.JSONDecodeError as e:
+                        if self.shutdown_event.is_set():
+                            break
+                        logger.error(f"WebSocket 消息解析失败: {e}")
                     except Exception as e:
                         if self.shutdown_event.is_set():
                             break
+                        cc = getattr(websockets, "ConnectionClosed", None)
+                        if cc is not None:
+                            try:
+                                if isinstance(e, cc):
+                                    break
+                            except Exception:
+                                pass
                         logger.error(f"WebSocket 消息处理失败: {e}")
-                        break
+                        continue
             finally:
                 self._ws = None
 
@@ -2600,15 +2691,27 @@ class GridTradingBot:
 
             # 检查持仓状态是否过时
             if time.time() - self.last_position_update_time > float(self.rest_sync_interval_sec or 0.0):
-                self.long_position, self.short_position = self.get_position()
-                self.last_position_update_time = time.time()
-                logger.info(f"同步 position: 多头 {self.long_position} 张, 空头 {self.short_position} 张 @ ticker")
+                if self._rest_allowed():
+                    try:
+                        self.long_position, self.short_position = self.get_position()
+                        self.last_position_update_time = time.time()
+                        self._rest_backoff_sec = 0.0
+                        logger.info(f"同步 position: 多头 {self.long_position} 张, 空头 {self.short_position} 张 @ ticker")
+                    except Exception as e:
+                        self.last_position_update_time = time.time()
+                        self._note_rest_error(e, "pos_sync")
 
             # 检查持仓状态是否过时
             if time.time() - self.last_orders_update_time > float(self.rest_sync_interval_sec or 0.0):
-                self.check_orders_status()
-                self.last_orders_update_time = time.time()
-                logger.info(f"同步 orders: 多头买单 {self.buy_long_orders} 张, 多头卖单 {self.sell_long_orders} 张,空头卖单 {self.sell_short_orders} 张, 空头买单 {self.buy_short_orders} 张 @ ticker")
+                if self._rest_allowed():
+                    try:
+                        self.check_orders_status()
+                        self.last_orders_update_time = time.time()
+                        self._rest_backoff_sec = 0.0
+                        logger.info(f"同步 orders: 多头买单 {self.buy_long_orders} 张, 多头卖单 {self.sell_long_orders} 张,空头卖单 {self.sell_short_orders} 张, 空头买单 {self.buy_short_orders} 张 @ ticker")
+                    except Exception as e:
+                        self.last_orders_update_time = time.time()
+                        self._note_rest_error(e, "orders_sync")
 
             await self.maybe_update_trailing_stop()
             await self.maybe_trigger_take_profit()
@@ -2677,44 +2780,6 @@ class GridTradingBot:
                         self.sell_fills += 1
                         self.short_position += filled
                         self.sell_short_orders = max(0.0, self.sell_short_orders - filled)
-
-                if reduce_only and _is_stop_like_ws_order(order):
-                    r = _stop_reason_from_ws_order(order) or "hard_stoploss"
-                    closed_side = "short" if side == "BUY" else "long"
-                    if closed_side == "long" and float(self.long_position or 0.0) <= 0:
-                        shutdown_reason = r
-                    if closed_side == "short" and float(self.short_position or 0.0) <= 0:
-                        shutdown_reason = r
-
-                if exec_type == "TRADE":
-                    if trade_sig is None or trade_sig not in self._last_trade_id_seen:
-                        if trade_sig is not None:
-                            self._last_trade_id_seen.add(trade_sig)
-                            if len(self._last_trade_id_seen) > int(self._last_trade_id_seen_max):
-                                self._last_trade_id_seen = set(list(self._last_trade_id_seen)[-int(self._last_trade_id_seen_max):])
-                        rp = self._safe_float(order.get("rp"))
-                        if rp is not None:
-                            self.instance_realized_pnl += float(rp)
-                        fee = self._safe_float(order.get("n"))
-                        fee_asset = str(order.get("N") or "").strip().upper()
-                        if fee is not None:
-                            self.instance_fees_by_asset[fee_asset or "UNKNOWN"] = float(self.instance_fees_by_asset.get(fee_asset or "UNKNOWN", 0.0)) + float(fee)
-                            if fee_asset == str(self.contract_type or "").strip().upper():
-                                self.instance_fees += float(fee)
-                fill_price = self._safe_float(order.get("ap"))
-                if fill_price is None:
-                    fill_price = self._safe_float(order.get("L"))
-                anchor_ps = None
-                if side == "BUY":
-                    anchor_ps = "SHORT" if reduce_only else "LONG"
-                elif side == "SELL":
-                    anchor_ps = "LONG" if reduce_only else "SHORT"
-                if anchor_ps is None:
-                    if position_side in {"LONG", "SHORT"}:
-                        anchor_ps = position_side
-                    else:
-                        anchor_ps = "LONG" if str(self.direction or "long") == "long" else "SHORT"
-                self._update_anchor_after_fill(anchor_ps, float(fill_price or 0.0))
             elif status == "CANCELED":
                 if side == "BUY":
                     if reduce_only:
@@ -2726,6 +2791,63 @@ class GridTradingBot:
                         self.sell_long_orders = max(0.0, self.sell_long_orders - quantity)
                     else:
                         self.sell_short_orders = max(0.0, self.sell_short_orders - quantity)
+
+            try:
+                cfg = self.risk_engine.get_config() or {}
+                active_side = str(self.direction or "long").strip().lower()
+                if active_side not in {"long", "short"}:
+                    active_side = "long"
+                pp = self._pending_entry_price(cfg)
+                if self._pending_entry_enabled(cfg) and pp is not None:
+                    expected_cid = self.risk_engine._pending_entry_client_id(active_side, float(pp))
+                else:
+                    expected_cid = None
+                cid_ws = str(order.get("c") or order.get("clientOrderId") or order.get("clientOrderID") or "").strip()
+                if (not reduce_only) and expected_cid and cid_ws == str(expected_cid) and status in {"PARTIALLY_FILLED", "FILLED"}:
+                    qty_for_stop = float(self._safe_float(order.get("z")) or filled or 0.0)
+                    if qty_for_stop <= 0:
+                        qty_for_stop = float(self._safe_float(order.get("q")) or 0.0)
+                    self._ensure_pending_entry_hardstop_locked(cfg, active_side, float(pp), float(qty_for_stop))
+            except Exception:
+                pass
+
+            if reduce_only and _is_stop_like_ws_order(order):
+                r = _stop_reason_from_ws_order(order) or "hard_stoploss"
+                closed_side = "short" if side == "BUY" else "long"
+                if closed_side == "long" and float(self.long_position or 0.0) <= 0:
+                    shutdown_reason = r
+                if closed_side == "short" and float(self.short_position or 0.0) <= 0:
+                    shutdown_reason = r
+
+            if exec_type == "TRADE":
+                if trade_sig is None or trade_sig not in self._last_trade_id_seen:
+                    if trade_sig is not None:
+                        self._last_trade_id_seen.add(trade_sig)
+                        if len(self._last_trade_id_seen) > int(self._last_trade_id_seen_max):
+                            self._last_trade_id_seen = set(list(self._last_trade_id_seen)[-int(self._last_trade_id_seen_max):])
+                    rp = self._safe_float(order.get("rp"))
+                    if rp is not None:
+                        self.instance_realized_pnl += float(rp)
+                    fee = self._safe_float(order.get("n"))
+                    fee_asset = str(order.get("N") or "").strip().upper()
+                    if fee is not None:
+                        self.instance_fees_by_asset[fee_asset or "UNKNOWN"] = float(self.instance_fees_by_asset.get(fee_asset or "UNKNOWN", 0.0)) + float(fee)
+                        if fee_asset == str(self.contract_type or "").strip().upper():
+                            self.instance_fees += float(fee)
+            fill_price = self._safe_float(order.get("ap"))
+            if fill_price is None:
+                fill_price = self._safe_float(order.get("L"))
+            anchor_ps = None
+            if side == "BUY":
+                anchor_ps = "SHORT" if reduce_only else "LONG"
+            elif side == "SELL":
+                anchor_ps = "LONG" if reduce_only else "SHORT"
+            if anchor_ps is None:
+                if position_side in {"LONG", "SHORT"}:
+                    anchor_ps = position_side
+                else:
+                    anchor_ps = "LONG" if str(self.direction or "long") == "long" else "SHORT"
+            self._update_anchor_after_fill(anchor_ps, float(fill_price or 0.0))
 
             if status in {"FILLED", "PARTIALLY_FILLED", "EXPIRED"}:
                 if status == "PARTIALLY_FILLED":
@@ -3083,6 +3205,102 @@ class GridTradingBot:
         except Exception:
             return None
 
+    def _pending_hardstop_client_id(self, side: str, pending_price: float, hard_stop_price: float):
+        try:
+            return self.risk_engine._pending_hardstop_client_id(side, float(pending_price), float(hard_stop_price))
+        except Exception:
+            return None
+
+    def _place_stop_market_reduce_only(self, side: str, quantity: float, stop_price: float, position_side: str, client_order_id: str):
+        sd = str(side or "").strip().lower()
+        if sd not in {"buy", "sell"}:
+            raise ValueError("invalid side")
+        q = self._safe_float(quantity)
+        sp = self._safe_float(stop_price)
+        if q is None or float(q) <= 0:
+            raise ValueError("invalid quantity")
+        if sp is None or float(sp) <= 0:
+            raise ValueError("invalid stop price")
+        params = {"stopPrice": float(sp)}
+        params["newClientOrderId"] = str(client_order_id or uuid.uuid4())
+        params["workingType"] = "CONTRACT_PRICE"
+        if not bool(getattr(self, "_hedge_mode", False)):
+            params["reduceOnly"] = True
+        if bool(getattr(self, "_hedge_mode", False)) and position_side is not None:
+            ps = str(position_side).strip().upper()
+            if ps in {"LONG", "SHORT"}:
+                params["positionSide"] = ps
+        return self.exchange.create_order(self.ccxt_symbol, "STOP_MARKET", sd, float(q), None, params)
+
+    def _ensure_pending_entry_hardstop_locked(self, cfg: dict, active_side: str, pending_price: float, pending_qty: float) -> None:
+        hs = self._safe_float((cfg or {}).get("HARD_STOPLOSS_PRICE", 0.0))
+        if hs is None or float(hs) <= 0:
+            return
+        s = str(active_side or "").strip().lower()
+        if s not in {"long", "short"}:
+            return
+        pp = float(pending_price)
+        hs_f = float(hs)
+        if s == "long" and hs_f >= pp:
+            if self._err_rate_limit("pending_hardstop_invalid_long", 10.0):
+                self._set_last_error(f"挂单安全硬止损无效：做多时硬止损价应 < 挂单价（挂单价={pp} 硬止损价={hs_f}）")
+            return
+        if s == "short" and hs_f <= pp:
+            if self._err_rate_limit("pending_hardstop_invalid_short", 10.0):
+                self._set_last_error(f"挂单安全硬止损无效：做空时硬止损价应 > 挂单价（挂单价={pp} 硬止损价={hs_f}）")
+            return
+        cid = self._pending_hardstop_client_id(s, pp, hs_f)
+        if not cid:
+            return
+        required_ps = None
+        if bool(getattr(self, "_hedge_mode", False)):
+            required_ps = "LONG" if s == "long" else "SHORT"
+        if not self._rest_allowed():
+            return
+        market_id = self._raw_market_id()
+        if not market_id:
+            return
+        desired_o_side = "sell" if s == "long" else "buy"
+        algo_orders = self._fetch_open_algo_orders(market_id)
+        for ao in (algo_orders or []):
+            try:
+                raw = ao or {}
+                status = str(raw.get("algoStatus") or raw.get("status") or "").strip().upper()
+                if status and status not in {"NEW"}:
+                    continue
+                if str(raw.get("clientAlgoId") or raw.get("clientOrderId") or raw.get("clientOrderID") or "").strip() != str(cid):
+                    continue
+                a_side = str(raw.get("side") or "").strip().lower()
+                if a_side != desired_o_side:
+                    continue
+                ot = str(raw.get("orderType") or raw.get("type") or "").strip().upper()
+                if "STOP" not in ot:
+                    continue
+                if required_ps is not None:
+                    ps = str(raw.get("positionSide") or "").strip().upper()
+                    if ps and ps not in {required_ps, "BOTH"}:
+                        continue
+                return
+            except Exception:
+                continue
+        try:
+            self._place_algo_conditional_order(
+                "STOP_MARKET",
+                desired_o_side.upper(),
+                float(hs_f),
+                position_side=required_ps if required_ps else None,
+                close_position=True,
+                client_algo_id=str(cid),
+            )
+            self._refresh_open_orders_cache()
+        except Exception as e:
+            es = str(e or "")
+            if ("-4509" in es) or ("No position" in es) or ("no position" in es):
+                if self._err_rate_limit("pending_hardstop_nopos", 10.0):
+                    self._set_last_error(f"交易所不允许无仓位预挂硬止损，将在挂单成交后立即补挂：{e}")
+                return
+            self._note_rest_error(e, "pending_hardstop")
+
     def _maybe_ensure_pending_entry_order_locked(self, cfg: dict) -> bool:
         if not self._pending_entry_enabled(cfg):
             return False
@@ -3095,12 +3313,13 @@ class GridTradingBot:
 
         pos = float(self.long_position or 0.0) if active_side == "long" else float(self.short_position or 0.0)
         if pos <= 0:
-            try:
-                lp, sp = self.get_position()
-                self.long_position, self.short_position = lp, sp
-                pos = float(lp or 0.0) if active_side == "long" else float(sp or 0.0)
-            except Exception:
-                pass
+            if self._rest_allowed():
+                try:
+                    lp, sp = self.get_position()
+                    self.long_position, self.short_position = lp, sp
+                    pos = float(lp or 0.0) if active_side == "long" else float(sp or 0.0)
+                except Exception as e:
+                    self._note_rest_error(e, "pending_pos")
         if pos > 0:
             try:
                 orders = self._get_open_orders_cached(max_age_sec=0.0) or []
@@ -3173,6 +3392,7 @@ class GridTradingBot:
                 o_price = round(float(o_price), int(self.price_precision or 0))
                 cid = str(self._get_order_client_id(o) or "")
                 if desired_id and cid == str(desired_id) and o_price == desired_price:
+                    self._ensure_pending_entry_hardstop_locked(cfg, active_side, float(pending_price), float(qty))
                     return True
             except Exception:
                 continue
@@ -3212,6 +3432,7 @@ class GridTradingBot:
         if o is not None:
             logger.info(f"挂单入场已下单: {active_side} {entry_side} @ {desired_price}")
         self._refresh_open_orders_cache()
+        self._ensure_pending_entry_hardstop_locked(cfg, active_side, float(pending_price), float(qty))
         return True
 
     # ==================== 策略逻辑 ====================
