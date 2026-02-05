@@ -3297,7 +3297,7 @@ class GridTradingBot:
             es = str(e or "")
             if ("-4509" in es) or ("No position" in es) or ("no position" in es):
                 if self._err_rate_limit("pending_hardstop_nopos", 10.0):
-                    self._set_last_error(f"交易所不允许无仓位预挂硬止损，将在挂单成交后立即补挂：{e}")
+                    self._set_last_error("交易所不允许无仓位预挂硬止损，将在挂单成交后立即补挂")
                 return
             self._note_rest_error(e, "pending_hardstop")
 

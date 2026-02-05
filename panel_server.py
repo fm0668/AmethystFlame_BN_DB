@@ -537,7 +537,7 @@ function ensureCard(slot){
   form.appendChild(el('div',{html:'跟踪回撤阶梯'})); form.appendChild(pbWrap);
   form.appendChild(el('div',{html:'止盈启用'})); form.appendChild(tpEnable);
   form.appendChild(el('div',{html:'止盈价格'})); form.appendChild(tpPrice);
-  form.appendChild(el('div',{html:'启动挂单'})); form.appendChild(pendingEnable);
+  form.appendChild(el('div',{html:'启用挂单'})); form.appendChild(pendingEnable);
   form.appendChild(el('div',{html:'挂单价格'})); form.appendChild(pendingPrice);
   card.appendChild(levList);
   card.appendChild(form);
