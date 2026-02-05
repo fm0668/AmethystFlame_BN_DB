@@ -376,6 +376,7 @@ class GridTradingBot:
         self._last_error_msg = None
         self._last_error_ts = 0.0
         self._err_rl = {}
+        self._deferred_pending_hardstop = None
 
         self.is_grid_stopped = False
         self._last_risk_eval_ts = 0.0
@@ -2803,7 +2804,7 @@ class GridTradingBot:
                 else:
                     expected_cid = None
                 cid_ws = str(order.get("c") or order.get("clientOrderId") or order.get("clientOrderID") or "").strip()
-                if (not reduce_only) and expected_cid and cid_ws == str(expected_cid) and status in {"PARTIALLY_FILLED", "FILLED"}:
+                if (not reduce_only) and expected_cid and cid_ws == str(expected_cid) and status in {"FILLED"}:
                     qty_for_stop = float(self._safe_float(order.get("z")) or filled or 0.0)
                     if qty_for_stop <= 0:
                         qty_for_stop = float(self._safe_float(order.get("q")) or 0.0)
@@ -3211,6 +3212,32 @@ class GridTradingBot:
         except Exception:
             return None
 
+    def _defer_pending_hardstop(self, active_side: str, pending_price: float, pending_qty: float) -> None:
+        try:
+            self._deferred_pending_hardstop = {
+                "side": str(active_side or "").strip().lower(),
+                "pending_price": float(pending_price),
+                "qty": float(pending_qty),
+                "ts": time.time(),
+            }
+        except Exception:
+            self._deferred_pending_hardstop = None
+
+    def _maybe_apply_deferred_pending_hardstop_locked(self, cfg: dict) -> None:
+        d = getattr(self, "_deferred_pending_hardstop", None)
+        if not d:
+            return
+        try:
+            side = str(d.get("side") or "").strip().lower()
+            pp = float(d.get("pending_price") or 0.0)
+            qty = float(d.get("qty") or 0.0)
+        except Exception:
+            self._deferred_pending_hardstop = None
+            return
+        ok = self._ensure_pending_entry_hardstop_locked(cfg, side, pp, qty)
+        if ok:
+            self._deferred_pending_hardstop = None
+
     def _place_stop_market_reduce_only(self, side: str, quantity: float, stop_price: float, position_side: str, client_order_id: str):
         sd = str(side or "").strip().lower()
         if sd not in {"buy", "sell"}:
@@ -3232,34 +3259,39 @@ class GridTradingBot:
                 params["positionSide"] = ps
         return self.exchange.create_order(self.ccxt_symbol, "STOP_MARKET", sd, float(q), None, params)
 
-    def _ensure_pending_entry_hardstop_locked(self, cfg: dict, active_side: str, pending_price: float, pending_qty: float) -> None:
+    def _ensure_pending_entry_hardstop_locked(self, cfg: dict, active_side: str, pending_price: float, pending_qty: float) -> bool:
         hs = self._safe_float((cfg or {}).get("HARD_STOPLOSS_PRICE", 0.0))
         if hs is None or float(hs) <= 0:
-            return
+            return False
         s = str(active_side or "").strip().lower()
         if s not in {"long", "short"}:
-            return
+            return False
+        pos_now = float(self.long_position or 0.0) if s == "long" else float(self.short_position or 0.0)
+        if pos_now <= 0:
+            return False
         pp = float(pending_price)
         hs_f = float(hs)
         if s == "long" and hs_f >= pp:
             if self._err_rate_limit("pending_hardstop_invalid_long", 10.0):
                 self._set_last_error(f"挂单安全硬止损无效：做多时硬止损价应 < 挂单价（挂单价={pp} 硬止损价={hs_f}）")
-            return
+            return False
         if s == "short" and hs_f <= pp:
             if self._err_rate_limit("pending_hardstop_invalid_short", 10.0):
                 self._set_last_error(f"挂单安全硬止损无效：做空时硬止损价应 > 挂单价（挂单价={pp} 硬止损价={hs_f}）")
-            return
+            return False
         cid = self._pending_hardstop_client_id(s, pp, hs_f)
         if not cid:
-            return
+            return False
         required_ps = None
         if bool(getattr(self, "_hedge_mode", False)):
             required_ps = "LONG" if s == "long" else "SHORT"
         if not self._rest_allowed():
-            return
+            self._defer_pending_hardstop(s, pp, pending_qty)
+            return False
         market_id = self._raw_market_id()
         if not market_id:
-            return
+            self._defer_pending_hardstop(s, pp, pending_qty)
+            return False
         desired_o_side = "sell" if s == "long" else "buy"
         algo_orders = self._fetch_open_algo_orders(market_id)
         for ao in (algo_orders or []):
@@ -3280,7 +3312,7 @@ class GridTradingBot:
                     ps = str(raw.get("positionSide") or "").strip().upper()
                     if ps and ps not in {required_ps, "BOTH"}:
                         continue
-                return
+                return True
             except Exception:
                 continue
         try:
@@ -3293,13 +3325,14 @@ class GridTradingBot:
                 client_algo_id=str(cid),
             )
             self._refresh_open_orders_cache()
+            return True
         except Exception as e:
             es = str(e or "")
             if ("-4509" in es) or ("No position" in es) or ("no position" in es):
-                if self._err_rate_limit("pending_hardstop_nopos", 10.0):
-                    self._set_last_error("交易所不允许无仓位预挂硬止损，将在挂单成交后立即补挂")
-                return
+                self._defer_pending_hardstop(s, pp, pending_qty)
+                return False
             self._note_rest_error(e, "pending_hardstop")
+            return False
 
     def _maybe_ensure_pending_entry_order_locked(self, cfg: dict) -> bool:
         if not self._pending_entry_enabled(cfg):
@@ -3392,7 +3425,6 @@ class GridTradingBot:
                 o_price = round(float(o_price), int(self.price_precision or 0))
                 cid = str(self._get_order_client_id(o) or "")
                 if desired_id and cid == str(desired_id) and o_price == desired_price:
-                    self._ensure_pending_entry_hardstop_locked(cfg, active_side, float(pending_price), float(qty))
                     return True
             except Exception:
                 continue
@@ -3432,7 +3464,6 @@ class GridTradingBot:
         if o is not None:
             logger.info(f"挂单入场已下单: {active_side} {entry_side} @ {desired_price}")
         self._refresh_open_orders_cache()
-        self._ensure_pending_entry_hardstop_locked(cfg, active_side, float(pending_price), float(qty))
         return True
 
     # ==================== 策略逻辑 ====================
@@ -3458,6 +3489,7 @@ class GridTradingBot:
         async with self.lock:
             if bool(getattr(self, "is_grid_stopped", False)):
                 return
+            self._maybe_apply_deferred_pending_hardstop_locked(cfg)
             if self._maybe_ensure_pending_entry_order_locked(cfg):
                 self._force_orders_resync = False
                 return
