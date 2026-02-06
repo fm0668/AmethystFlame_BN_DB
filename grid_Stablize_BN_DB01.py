@@ -346,6 +346,10 @@ class GridTradingBot:
         self._last_long_grid_action_ts = 0.0
         self._last_short_grid_action_ts = 0.0
         self._grid_action_cooldown_sec = 1.2
+        self._grid_action_bypass_until_long = 0.0
+        self._grid_action_bypass_until_short = 0.0
+        self._last_slow_requote_ts_long = 0.0
+        self._last_slow_requote_ts_short = 0.0
         self._last_postonly_reject_ts_long = 0.0
         self._last_postonly_reject_ts_short = 0.0
         self._postonly_reject_cooldown_sec = 2.0
@@ -969,8 +973,11 @@ class GridTradingBot:
         cid = order.get("clientOrderId")
         if cid:
             return str(cid)
+        cid = order.get("newClientOrderId")
+        if cid:
+            return str(cid)
         info = order.get("info") or {}
-        cid = info.get("clientOrderId") or info.get("c")
+        cid = info.get("clientOrderId") or info.get("newClientOrderId") or info.get("c")
         if cid:
             return str(cid)
         return None
@@ -1145,6 +1152,28 @@ class GridTradingBot:
             self._last_long_grid_action_ts = now
         elif s == "short":
             self._last_short_grid_action_ts = now
+
+    def _grid_action_bypass_active(self, side: str) -> bool:
+        now = time.time()
+        s = str(side or "").strip().lower()
+        if s == "long":
+            until = float(getattr(self, "_grid_action_bypass_until_long", 0.0) or 0.0)
+        elif s == "short":
+            until = float(getattr(self, "_grid_action_bypass_until_short", 0.0) or 0.0)
+        else:
+            return False
+        return now < until
+
+    def _set_grid_action_bypass(self, side: str, window_sec: float = 2.0) -> None:
+        now = time.time()
+        w = float(window_sec or 0.0)
+        if w <= 0:
+            return
+        s = str(side or "").strip().lower()
+        if s == "long":
+            self._grid_action_bypass_until_long = max(float(getattr(self, "_grid_action_bypass_until_long", 0.0) or 0.0), now + w)
+        elif s == "short":
+            self._grid_action_bypass_until_short = max(float(getattr(self, "_grid_action_bypass_until_short", 0.0) or 0.0), now + w)
 
     def _mark_postonly_reject(self, side: str):
         now = time.time()
@@ -2849,6 +2878,10 @@ class GridTradingBot:
                 else:
                     anchor_ps = "LONG" if str(self.direction or "long") == "long" else "SHORT"
             self._update_anchor_after_fill(anchor_ps, float(fill_price or 0.0))
+            if status == "FILLED" and exec_type == "TRADE":
+                filled_side = "long" if str(anchor_ps) == "LONG" else "short"
+                self._set_grid_action_bypass(filled_side, window_sec=2.0)
+                self._force_orders_resync = True
 
             if status in {"FILLED", "PARTIALLY_FILLED", "EXPIRED"}:
                 if status == "PARTIALLY_FILLED":
@@ -3101,6 +3134,36 @@ class GridTradingBot:
                 logger.error(f"撤单失败: {e}")
             finally:
                 self._refresh_open_orders_cache()
+
+    def cancel_grid_orders_for_side(self, position_side: str, cancel_add: bool = True, cancel_tp: bool = True):
+        orders = self._get_open_orders_cached(max_age_sec=0.0)
+        if not orders:
+            return
+        ps_target = str(position_side or "").strip().lower()
+        for order in orders:
+            try:
+                if self._is_stop_order(order):
+                    continue
+                info = (order or {}).get("info") or {}
+                o_side = str((order or {}).get("side") or info.get("side") or info.get("S") or "").strip().lower()
+                if o_side not in {"buy", "sell"}:
+                    continue
+                reduce_only = self._get_order_reduce_only(order)
+                ps = self._get_order_position_side(order)
+                if bool(getattr(self, "_hedge_mode", False)):
+                    if ps_target == "long" and ps not in {"LONG"}:
+                        continue
+                    if ps_target == "short" and ps not in {"SHORT"}:
+                        continue
+                is_add = (not reduce_only) and ((ps_target == "long" and o_side == "buy") or (ps_target == "short" and o_side == "sell"))
+                is_tp = reduce_only and ((ps_target == "long" and o_side == "sell") or (ps_target == "short" and o_side == "buy"))
+                if (is_add and cancel_add) or (is_tp and cancel_tp):
+                    oid = order.get("id")
+                    if oid:
+                        self.cancel_order(oid)
+            except Exception:
+                continue
+        self._refresh_open_orders_cache()
 
     def cancel_order(self, order_id):
         """撤单"""
@@ -3559,6 +3622,62 @@ class GridTradingBot:
                     add_usdc = float((plan.get("add") or {}).get("size_usdc") or 0.0)
                     tp_usdc = float((plan.get("tp") or {}).get("size_usdc") or 0.0)
 
+                    slow_enabled = bool(cfg.get("SLOW_TREND_REQUOTE_ENABLED", False))
+                    slow_min_itv = float(cfg.get("SLOW_TREND_REQUOTE_MIN_INTERVAL_SEC", 60.0) or 0.0)
+                    slow_max_age = float(cfg.get("SLOW_TREND_MAX_ORDER_AGE_SEC", 120.0) or 0.0)
+                    slow_drift_steps = float(cfg.get("SLOW_TREND_MAX_DRIFT_STEPS", 3.0) or 0.0)
+                    if slow_enabled and anchor > 0 and (slow_min_itv >= 0) and (slow_max_age >= 0) and (slow_drift_steps >= 0):
+                        if side == "long":
+                            last_rq = float(getattr(self, "_last_slow_requote_ts_long", 0.0) or 0.0)
+                        else:
+                            last_rq = float(getattr(self, "_last_slow_requote_ts_short", 0.0) or 0.0)
+                        allow_rq = (slow_min_itv == 0) or ((now - last_rq) >= slow_min_itv)
+                        if allow_rq:
+                            add_side2 = "buy" if side == "long" else "sell"
+                            tp_side2 = "sell" if side == "long" else "buy"
+                            required_ps2 = None
+                            if bool(getattr(self, "_hedge_mode", False)):
+                                required_ps2 = "LONG" if side == "long" else "SHORT"
+                            oldest_ts = None
+                            for o in orders:
+                                try:
+                                    if self._is_stop_order(o):
+                                        continue
+                                    if required_ps2 is not None and self._get_order_position_side(o) != required_ps2:
+                                        continue
+                                    info2 = (o or {}).get("info") or {}
+                                    o_side2 = str((o or {}).get("side") or info2.get("side") or info2.get("S") or "").strip().lower()
+                                    if o_side2 not in {"buy", "sell"}:
+                                        continue
+                                    ro2 = self._get_order_reduce_only(o)
+                                    if (not ro2) and o_side2 == add_side2:
+                                        ts2 = self._get_order_timestamp_sec(o)
+                                    elif ro2 and o_side2 == tp_side2:
+                                        ts2 = self._get_order_timestamp_sec(o)
+                                    else:
+                                        continue
+                                    if ts2 is None:
+                                        continue
+                                    oldest_ts = ts2 if oldest_ts is None else min(float(oldest_ts), float(ts2))
+                                except Exception:
+                                    continue
+                            drift_unit = max(float(add_spacing or 0.0), float(tp_spacing or 0.0))
+                            drift_threshold = float(drift_unit) * float(slow_drift_steps)
+                            drift_ok = False
+                            if drift_threshold > 0:
+                                drift_ok = abs((float(self.latest_price) - float(anchor)) / float(anchor)) >= drift_threshold
+                            age_ok = False
+                            if slow_max_age > 0 and oldest_ts is not None:
+                                age_ok = (now - float(oldest_ts)) >= slow_max_age
+                            if age_ok or drift_ok:
+                                anchor = float(self.latest_price)
+                                if side == "long":
+                                    self.mid_price_long = float(anchor)
+                                    self._last_slow_requote_ts_long = float(now)
+                                else:
+                                    self.mid_price_short = float(anchor)
+                                    self._last_slow_requote_ts_short = float(now)
+
                     if side == "long":
                         fixed_add_price = anchor * (1.0 - add_spacing)
                         fixed_tp_price = anchor * (1.0 + tp_spacing)
@@ -3609,7 +3728,8 @@ class GridTradingBot:
                         continue
                     ps = self._get_order_position_side(o)
                     ro = self._get_order_reduce_only(o)
-                    o_side = str((o or {}).get("side") or "").strip().lower()
+                    info = (o or {}).get("info") or {}
+                    o_side = str((o or {}).get("side") or info.get("side") or info.get("S") or "").strip().lower()
                     if o_side not in {"buy", "sell"}:
                         continue
                     o_qty = self._safe_float((o or {}).get("remaining"))
@@ -3632,29 +3752,29 @@ class GridTradingBot:
                         if (not ro) and o_side == add_side:
                             add_present = True
                             add_order_ts = self._get_order_timestamp_sec(o) or add_order_ts
-                            if desired_add_id is not None and str(o_cid or "") == desired_add_id:
+                            if desired_add_id is not None and (o_cid is None or str(o_cid or "") == desired_add_id):
                                 add_id_ok = True
                             if o_price == add_price_target:
-                                if desired_add_id is None or str(o_cid or "") == desired_add_id:
+                                if desired_add_id is None or o_cid is None or str(o_cid or "") == desired_add_id:
                                     add_ok = True
                         if ro and o_side == tp_side:
                             tp_present = True
                             if o_price == tp_price_target:
-                                if desired_tp_id is None or str(o_cid or "") == desired_tp_id:
+                                if desired_tp_id is None or o_cid is None or str(o_cid or "") == desired_tp_id:
                                     tp_ok = True
                     else:
                         if (not ro) and o_side == add_side:
                             add_present = True
                             add_order_ts = self._get_order_timestamp_sec(o) or add_order_ts
-                            if desired_add_id is not None and str(o_cid or "") == desired_add_id:
+                            if desired_add_id is not None and (o_cid is None or str(o_cid or "") == desired_add_id):
                                 add_id_ok = True
                             if o_price == add_price_target:
-                                if desired_add_id is None or str(o_cid or "") == desired_add_id:
+                                if desired_add_id is None or o_cid is None or str(o_cid or "") == desired_add_id:
                                     add_ok = True
                         if ro and o_side == tp_side:
                             tp_present = True
                             if o_price == tp_price_target:
-                                if desired_tp_id is None or str(o_cid or "") == desired_tp_id:
+                                if desired_tp_id is None or o_cid is None or str(o_cid or "") == desired_tp_id:
                                     tp_ok = True
 
                 add_qty = (plan.get("add") or {}).get("qty")
@@ -3682,7 +3802,8 @@ class GridTradingBot:
                         refresh_initial = True
 
                 if pos > 0:
-                    need_reset = bool(getattr(self, "_force_orders_resync", False)) or (not add_ok) or (not tp_ok)
+                    need_update_add = bool(getattr(self, "_force_orders_resync", False)) or (not add_ok)
+                    need_update_tp = bool(getattr(self, "_force_orders_resync", False)) or (not tp_ok)
                 else:
                     need_reset = (
                         bool(getattr(self, "_force_orders_resync", False))
@@ -3691,14 +3812,23 @@ class GridTradingBot:
                         or refresh_initial
                     )
 
-                if need_reset and (not self._in_grid_action_cooldown(side)):
+                bypass = self._grid_action_bypass_active(side)
+                action_allowed = bypass or (not self._in_grid_action_cooldown(side))
+
+                if pos > 0:
+                    if (not need_tp):
+                        need_update_tp = False
+                    need_reset = bool(need_update_add or need_update_tp)
+
+                if need_reset and action_allowed:
                     if maker_only and self._recent_postonly_reject(side):
                         continue
                     self._mark_grid_action(side)
-                    try:
-                        self.cancel_orders_for_side(side)
-                    except Exception:
-                        pass
+                    if bypass:
+                        if str(side) == "long":
+                            self._grid_action_bypass_until_long = 0.0
+                        elif str(side) == "short":
+                            self._grid_action_bypass_until_short = 0.0
 
                     if pos <= 0 and refresh_initial:
                         logger.info(f"刷新 {side} 初始开仓挂单到最优价")
@@ -3714,16 +3844,26 @@ class GridTradingBot:
                                 add_qty = self.usdc_to_amount(add_usdc, add_price)
                         else:
                             add_price = float((plan.get("add") or {}).get("price") or 0.0)
+                            if not bool(need_update_add):
+                                add_price = None
 
-                        o = self.place_order(
-                            add_side,
-                            price=add_price,
-                            quantity=float(add_qty),
-                            is_reduce_only=False,
-                            position_side=side,
-                            order_type="limit",
-                            client_order_id=desired_add_id,
-                        )
+                        if add_price is not None:
+                            try:
+                                if pos > 0:
+                                    self.cancel_grid_orders_for_side(side, cancel_add=True, cancel_tp=False)
+                                else:
+                                    self.cancel_orders_for_side(side)
+                            except Exception:
+                                pass
+                            o = self.place_order(
+                                add_side,
+                                price=add_price,
+                                quantity=float(add_qty),
+                                is_reduce_only=False,
+                                position_side=side,
+                                order_type="limit",
+                                client_order_id=desired_add_id,
+                            )
                         if pos <= 0 and o is not None:
                             if side == "long":
                                 self.last_long_order_time = now
@@ -3733,15 +3873,20 @@ class GridTradingBot:
                     if need_tp:
                         tp_price = float((plan.get("tp") or {}).get("price") or 0.0)
                         tp_side = "sell" if side == "long" else "buy"
-                        self.place_order(
-                            tp_side,
-                            price=tp_price,
-                            quantity=float(tp_qty),
-                            is_reduce_only=True,
-                            position_side=side,
-                            order_type="limit",
-                            client_order_id=desired_tp_id,
-                        )
+                        if bool(need_update_tp):
+                            try:
+                                self.cancel_grid_orders_for_side(side, cancel_add=False, cancel_tp=True)
+                            except Exception:
+                                pass
+                            self.place_order(
+                                tp_side,
+                                price=tp_price,
+                                quantity=float(tp_qty),
+                                is_reduce_only=True,
+                                position_side=side,
+                                order_type="limit",
+                                client_order_id=desired_tp_id,
+                            )
 
             self._force_orders_resync = False
 

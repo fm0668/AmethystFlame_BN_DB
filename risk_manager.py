@@ -34,6 +34,10 @@ class RiskEngine:
             "REST_SYNC_INTERVAL_SEC": 10.0,
             "ORDER_FIRST_TIME_SEC": 10.0,
             "GRID_ACTION_COOLDOWN_SEC": 1.2,
+            "SLOW_TREND_REQUOTE_ENABLED": False,
+            "SLOW_TREND_REQUOTE_MIN_INTERVAL_SEC": 60.0,
+            "SLOW_TREND_MAX_ORDER_AGE_SEC": 120.0,
+            "SLOW_TREND_MAX_DRIFT_STEPS": 3.0,
             "STATUS_LOG_INTERVAL_SEC": 60.0,
             "RISK_EVAL_MIN_INTERVAL_SEC": 0.8,
             "STOP_ON_HARDSTOP": True,
@@ -71,6 +75,10 @@ class RiskEngine:
             "状态同步间隔秒": "REST_SYNC_INTERVAL_SEC",
             "首次下单等待秒": "ORDER_FIRST_TIME_SEC",
             "最小重挂间隔秒": "GRID_ACTION_COOLDOWN_SEC",
+            "慢单边追踪重挂": "SLOW_TREND_REQUOTE_ENABLED",
+            "慢单边重挂最小间隔秒": "SLOW_TREND_REQUOTE_MIN_INTERVAL_SEC",
+            "慢单边重挂最大挂单秒": "SLOW_TREND_MAX_ORDER_AGE_SEC",
+            "慢单边重挂偏移格数": "SLOW_TREND_MAX_DRIFT_STEPS",
             "状态日志间隔秒": "STATUS_LOG_INTERVAL_SEC",
             "风控最小评估间隔秒": "RISK_EVAL_MIN_INTERVAL_SEC",
             "硬止损后停止策略": "STOP_ON_HARDSTOP",
@@ -110,6 +118,14 @@ class RiskEngine:
                 out["MAKER_ONLY"] = grid.get("只做MAKER")
             if "只做Maker" in grid:
                 out["MAKER_ONLY"] = grid.get("只做Maker")
+            if "慢单边追踪重挂" in grid:
+                out["SLOW_TREND_REQUOTE_ENABLED"] = grid.get("慢单边追踪重挂")
+            if "慢单边重挂最小间隔秒" in grid:
+                out["SLOW_TREND_REQUOTE_MIN_INTERVAL_SEC"] = grid.get("慢单边重挂最小间隔秒")
+            if "慢单边重挂最大挂单秒" in grid:
+                out["SLOW_TREND_MAX_ORDER_AGE_SEC"] = grid.get("慢单边重挂最大挂单秒")
+            if "慢单边重挂偏移格数" in grid:
+                out["SLOW_TREND_MAX_DRIFT_STEPS"] = grid.get("慢单边重挂偏移格数")
 
         funds = raw.get("资金")
         if isinstance(funds, dict):
@@ -227,6 +243,20 @@ class RiskEngine:
         if cooldown < 0:
             raise ValueError("GRID_ACTION_COOLDOWN_SEC must be >= 0")
         cfg["GRID_ACTION_COOLDOWN_SEC"] = float(cooldown)
+
+        cfg["SLOW_TREND_REQUOTE_ENABLED"] = bool(cfg.get("SLOW_TREND_REQUOTE_ENABLED", False))
+        slow_min_itv = float(cfg.get("SLOW_TREND_REQUOTE_MIN_INTERVAL_SEC", 60.0) or 0.0)
+        if slow_min_itv < 0:
+            raise ValueError("SLOW_TREND_REQUOTE_MIN_INTERVAL_SEC must be >= 0")
+        cfg["SLOW_TREND_REQUOTE_MIN_INTERVAL_SEC"] = float(slow_min_itv)
+        slow_max_age = float(cfg.get("SLOW_TREND_MAX_ORDER_AGE_SEC", 120.0) or 0.0)
+        if slow_max_age < 0:
+            raise ValueError("SLOW_TREND_MAX_ORDER_AGE_SEC must be >= 0")
+        cfg["SLOW_TREND_MAX_ORDER_AGE_SEC"] = float(slow_max_age)
+        slow_drift = float(cfg.get("SLOW_TREND_MAX_DRIFT_STEPS", 3.0) or 0.0)
+        if slow_drift < 0:
+            raise ValueError("SLOW_TREND_MAX_DRIFT_STEPS must be >= 0")
+        cfg["SLOW_TREND_MAX_DRIFT_STEPS"] = float(slow_drift)
 
         status_itv = float(cfg.get("STATUS_LOG_INTERVAL_SEC", 60.0))
         if status_itv <= 0:
