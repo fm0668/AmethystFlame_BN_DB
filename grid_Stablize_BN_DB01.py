@@ -3206,7 +3206,8 @@ class GridTradingBot:
                     return None
 
                 maker_only = self._maker_only_enabled()
-                if maker_only:
+                maker_only_limit = bool(maker_only) and (not bool(is_reduce_only))
+                if maker_only_limit:
                     price_po = self._post_only_price(side, price)
                     if price_po is None:
                         return None
@@ -3235,13 +3236,13 @@ class GridTradingBot:
                     params["reduceOnly"] = True
                 if bool(getattr(self, "_hedge_mode", False)) and position_side is not None:
                     params['positionSide'] = str(position_side).strip().upper()
-                if maker_only:
+                if maker_only_limit:
                     params["timeInForce"] = "GTX"
                 try:
                     order = self.exchange.create_order(self.ccxt_symbol, 'limit', side, quantity, price, params)
                     return order
                 except ccxt.BaseError as e:
-                    if maker_only:
+                    if maker_only_limit:
                         msg = str(e).lower()
                         if ("5022" in msg) or ("post" in msg and "only" in msg) or ("immediately match" in msg):
                             ps = str(position_side or "").strip().lower()
@@ -3822,7 +3823,13 @@ class GridTradingBot:
 
                 if need_reset and action_allowed:
                     if maker_only and self._recent_postonly_reject(side):
-                        continue
+                        if pos > 0 and bool(need_update_tp) and (not bool(need_update_add)):
+                            pass
+                        elif pos > 0 and bool(need_update_tp) and bool(need_update_add):
+                            need_update_add = False
+                            need_reset = bool(need_update_add or need_update_tp)
+                        else:
+                            continue
                     self._mark_grid_action(side)
                     if bypass:
                         if str(side) == "long":
@@ -3834,6 +3841,7 @@ class GridTradingBot:
                         logger.info(f"刷新 {side} 初始开仓挂单到最优价")
 
                     if add_qty is not None and float(add_qty) > 0:
+                        o = None
                         if pos <= 0:
                             best = self.best_bid_price if side == "long" else self.best_ask_price
                             add_price = float(best or 0.0)
