@@ -3206,12 +3206,30 @@ class GridTradingBot:
                     return None
 
                 maker_only = self._maker_only_enabled()
+                try:
+                    cfg = self.risk_engine.get_config() or {}
+                except Exception:
+                    cfg = {}
+                tp_maker_only = self._safe_bool((cfg or {}).get("TP_MAKER_ONLY"), False)
                 maker_only_limit = bool(maker_only) and (not bool(is_reduce_only))
-                if maker_only_limit:
+                maker_only_tp = False
+                if bool(is_reduce_only) and order_type == "limit" and bool(tp_maker_only):
+                    bid = self._safe_float(getattr(self, "best_bid_price", None)) or 0.0
+                    ask = self._safe_float(getattr(self, "best_ask_price", None)) or 0.0
+                    s2 = str(side or "").strip().lower()
+                    p2 = self._safe_float(price) or 0.0
+                    marketable = False
+                    if s2 == "sell":
+                        marketable = (bid > 0 and p2 > 0 and p2 <= bid)
+                    elif s2 == "buy":
+                        marketable = (ask > 0 and p2 > 0 and p2 >= ask)
+                    maker_only_tp = (not marketable)
+                if maker_only_limit or maker_only_tp:
                     price_po = self._post_only_price(side, price)
                     if price_po is None:
                         return None
                     price = price_po
+
 
                 if (not bool(is_reduce_only)) and position_side is not None:
                     desired_ps = str(position_side).strip().upper()
@@ -3236,18 +3254,28 @@ class GridTradingBot:
                     params["reduceOnly"] = True
                 if bool(getattr(self, "_hedge_mode", False)) and position_side is not None:
                     params['positionSide'] = str(position_side).strip().upper()
-                if maker_only_limit:
+                if maker_only_limit or maker_only_tp:
                     params["timeInForce"] = "GTX"
                 try:
                     order = self.exchange.create_order(self.ccxt_symbol, 'limit', side, quantity, price, params)
                     return order
                 except ccxt.BaseError as e:
-                    if maker_only_limit:
+                    if maker_only_limit or maker_only_tp:
                         msg = str(e).lower()
                         if ("5022" in msg) or ("post" in msg and "only" in msg) or ("immediately match" in msg):
                             ps = str(position_side or "").strip().lower()
                             if ps in {"long", "short"}:
                                 self._mark_postonly_reject(ps)
+                            if maker_only_tp:
+                                try:
+                                    params2 = {"newClientOrderId": params.get("newClientOrderId")}
+                                    if bool(is_reduce_only) and (not bool(getattr(self, "_hedge_mode", False))):
+                                        params2["reduceOnly"] = True
+                                    if bool(getattr(self, "_hedge_mode", False)) and position_side is not None:
+                                        params2["positionSide"] = str(position_side).strip().upper()
+                                    return self.exchange.create_order(self.ccxt_symbol, 'limit', side, quantity, price, params2)
+                                except Exception:
+                                    return None
                             return None
                     raise e
 

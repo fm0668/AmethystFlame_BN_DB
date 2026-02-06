@@ -34,6 +34,7 @@ class RiskEngine:
             "REST_SYNC_INTERVAL_SEC": 10.0,
             "ORDER_FIRST_TIME_SEC": 10.0,
             "GRID_ACTION_COOLDOWN_SEC": 1.2,
+            "TP_MAKER_ONLY": False,
             "SLOW_TREND_REQUOTE_ENABLED": False,
             "SLOW_TREND_REQUOTE_MIN_INTERVAL_SEC": 60.0,
             "SLOW_TREND_MAX_ORDER_AGE_SEC": 120.0,
@@ -69,6 +70,7 @@ class RiskEngine:
             "底仓金额": "BASE_POSITION_USDC",
             "只做MAKER": "MAKER_ONLY",
             "只做Maker": "MAKER_ONLY",
+            "止盈只做MAKER": "TP_MAKER_ONLY",
             "基础网格间距": "BASE_GRID_SPACING",
             "基础下单金额USDC": "BASE_ORDER_SIZE_USDC",
             "基础下单金额USDT": "BASE_ORDER_SIZE_USDC",
@@ -118,6 +120,8 @@ class RiskEngine:
                 out["MAKER_ONLY"] = grid.get("只做MAKER")
             if "只做Maker" in grid:
                 out["MAKER_ONLY"] = grid.get("只做Maker")
+            if "止盈只做MAKER" in grid:
+                out["TP_MAKER_ONLY"] = grid.get("止盈只做MAKER")
             if "慢单边追踪重挂" in grid:
                 out["SLOW_TREND_REQUOTE_ENABLED"] = grid.get("慢单边追踪重挂")
             if "慢单边重挂最小间隔秒" in grid:
@@ -243,6 +247,8 @@ class RiskEngine:
         if cooldown < 0:
             raise ValueError("GRID_ACTION_COOLDOWN_SEC must be >= 0")
         cfg["GRID_ACTION_COOLDOWN_SEC"] = float(cooldown)
+
+        cfg["TP_MAKER_ONLY"] = bool(cfg.get("TP_MAKER_ONLY", False))
 
         cfg["SLOW_TREND_REQUOTE_ENABLED"] = bool(cfg.get("SLOW_TREND_REQUOTE_ENABLED", False))
         slow_min_itv = float(cfg.get("SLOW_TREND_REQUOTE_MIN_INTERVAL_SEC", 60.0) or 0.0)
