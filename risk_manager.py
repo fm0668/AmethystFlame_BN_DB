@@ -35,6 +35,7 @@ class RiskEngine:
             "OPEN_ORDERS_CACHE_SEC": 10.0,
             "POSITION_SYNC_INTERVAL_SEC": 60.0,
             "ORDERS_SYNC_INTERVAL_SEC": 60.0,
+            "UI_HIDE_REST_ERRORS": False,
             "ORDER_FIRST_TIME_SEC": 10.0,
             "GRID_ACTION_COOLDOWN_SEC": 1.2,
             "TP_MAKER_ONLY": False,
@@ -98,6 +99,7 @@ class RiskEngine:
             "启用热加载": "HOT_RELOAD_ENABLED",
             "热加载检查间隔秒": "CONFIG_WATCH_INTERVAL_SEC",
             "热加载错误日志间隔秒": "CONFIG_ERROR_LOG_INTERVAL_SEC",
+            "UI隐藏REST错误": "UI_HIDE_REST_ERRORS",
         }
         out = {}
         for k, v in (raw or {}).items():
@@ -160,6 +162,8 @@ class RiskEngine:
                 out["POSITION_SYNC_INTERVAL_SEC"] = sync.get("POSITION_SYNC_INTERVAL_SEC")
             if "ORDERS_SYNC_INTERVAL_SEC" in sync:
                 out["ORDERS_SYNC_INTERVAL_SEC"] = sync.get("ORDERS_SYNC_INTERVAL_SEC")
+            if "UI_HIDE_REST_ERRORS" in sync:
+                out["UI_HIDE_REST_ERRORS"] = sync.get("UI_HIDE_REST_ERRORS")
 
         hot = raw.get("热加载")
         if isinstance(hot, dict):

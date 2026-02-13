@@ -343,6 +343,8 @@ class GridTradingBot:
         self._ws = None
         self._open_orders_cache = None
         self._open_orders_cache_ts = 0.0
+        self._position_snapshot_cache = None
+        self._position_snapshot_cache_ts = 0.0
         self._orders_dirty = True
         self._force_risk_eval_once = False
         self._open_orders_cache_sec = _safe_float(os.getenv("OPEN_ORDERS_CACHE_SEC", "10"), 10.0)
@@ -474,7 +476,15 @@ class GridTradingBot:
             "alive": True,
             "health": {
                 "state": state,
-                "last_error": getattr(self, "_last_error_msg", None),
+                "last_error": (
+                    None
+                    if (
+                        bool(cfg.get("UI_HIDE_REST_ERRORS", False))
+                        and isinstance(getattr(self, "_last_error_msg", None), str)
+                        and str(getattr(self, "_last_error_msg", "")).startswith("REST ")
+                    )
+                    else getattr(self, "_last_error_msg", None)
+                ),
                 "last_ws_ts": float(self._last_ws_msg_ts or 0.0),
                 "last_ticker_ts": float(self.last_ticker_update_time or 0.0),
                 "last_rest_pos_sync_ts": float(self.last_position_update_time or 0.0),
@@ -1503,12 +1513,37 @@ class GridTradingBot:
             await asyncio.sleep(self._status_log_interval_sec)
 
     def get_position_snapshot(self):
+        now = time.time()
+        cached = getattr(self, "_position_snapshot_cache", None)
+        ts = float(getattr(self, "_position_snapshot_cache_ts", 0.0) or 0.0)
+        try:
+            max_age = float(getattr(self, "_position_sync_interval_sec", 60.0) or 60.0)
+        except Exception:
+            max_age = 60.0
+        if max_age <= 0:
+            max_age = 60.0
+        if cached is not None and (now - ts) <= float(max_age):
+            return cached
+        if not self._rest_allowed():
+            if cached is not None:
+                return cached
+            return {
+                "long": {"amt": 0.0, "pnl": 0.0, "entry_price": None},
+                "short": {"amt": 0.0, "pnl": 0.0, "entry_price": None},
+            }
+
         params = {"type": "future"}
         try:
             positions = self.exchange.fetch_positions(params=params)
         except Exception as e:
             self._note_rest_error(e, "pos_snapshot")
-            raise
+            self._position_snapshot_cache_ts = now
+            if cached is not None:
+                return cached
+            return {
+                "long": {"amt": 0.0, "pnl": 0.0, "entry_price": None},
+                "short": {"amt": 0.0, "pnl": 0.0, "entry_price": None},
+            }
         out = {
             "long": {"amt": 0.0, "pnl": 0.0, "entry_price": None},
             "short": {"amt": 0.0, "pnl": 0.0, "entry_price": None},
@@ -1545,6 +1580,8 @@ class GridTradingBot:
                 out["short"]["amt"] = max(0.0, float(amt))
                 out["short"]["pnl"] = float(pnl)
                 out["short"]["entry_price"] = entry
+        self._position_snapshot_cache = out
+        self._position_snapshot_cache_ts = now
         return out
 
     def _cancel_stop_orders_for_side(self, side: str, keep_client_ids=None):
@@ -2256,47 +2293,16 @@ class GridTradingBot:
         hs_price = self._safe_float(cfg.get("HARD_STOPLOSS_PRICE", 0.0))
         if hs_price is None or hs_price <= 0:
             return
-        if not self._rest_allowed():
-            return
         if float(self.latest_price or 0.0) <= 0:
             return
-
-        transient_types = (
-            getattr(ccxt, "NetworkError", Exception),
-            getattr(ccxt, "RequestTimeout", Exception),
-            getattr(ccxt, "ExchangeNotAvailable", Exception),
-            getattr(ccxt, "DDoSProtection", Exception),
-        )
-
-        last_err = None
-        long_amt = short_amt = long_pnl = short_pnl = None
-        for attempt in range(2):
-            try:
-                long_amt, short_amt, long_pnl, short_pnl = self.get_position_risk()
-                last_err = None
-                break
-            except Exception as e:
-                last_err = e
-                if attempt == 0 and isinstance(e, transient_types):
-                    await asyncio.sleep(0.25)
-                    continue
-                break
-
-        if last_err is not None:
-            logger.error(f"获取持仓浮盈亏失败({type(last_err).__name__}): {last_err}")
-            return
-        self.long_position = float(long_amt or 0.0)
-        self.short_position = float(short_amt or 0.0)
 
         active = str(self.direction or "long").strip().lower()
         if active not in {"long", "short"}:
             active = "long"
         if active == "long":
-            amt = float(long_amt or 0.0)
-            pnl = None if long_pnl is None else float(long_pnl)
+            amt = float(self.long_position or 0.0)
         else:
-            amt = float(short_amt or 0.0)
-            pnl = None if short_pnl is None else float(short_pnl)
+            amt = float(self.short_position or 0.0)
 
         if amt <= 0:
             return
@@ -2311,6 +2317,13 @@ class GridTradingBot:
             reason = f"price={float(self.latest_price):.6f}>=stop_price={float(hs_price):.6f}"
         if not breached:
             return
+        pnl = 0.0
+        try:
+            snap = getattr(self, "_position_snapshot_cache", None)
+            if isinstance(snap, dict):
+                pnl = float(self._safe_float((snap.get(active) or {}).get("pnl")) or 0.0)
+        except Exception:
+            pnl = 0.0
 
         await self._trigger_hardstop(active, float(pnl or 0.0), str(reason or ""))
 
@@ -2507,17 +2520,48 @@ class GridTradingBot:
         # print(positions)
         long_position = 0
         short_position = 0
+        snap = {
+            "long": {"amt": 0.0, "pnl": 0.0, "entry_price": None},
+            "short": {"amt": 0.0, "pnl": 0.0, "entry_price": None},
+        }
 
         for position in positions:
             if position['symbol'] == self.ccxt_symbol:  # 使用动态的 symbol 变量
                 side = self._position_side_from_ccxt_position(position)  # 获取仓位方向
                 amount = abs(float(self._position_amount_from_ccxt_position(position) or 0.0))
+                pnl = self._safe_float(position.get("unrealizedPnl"))
+                if pnl is None:
+                    pnl = self._safe_float(position.get("unrealizedProfit"))
+                info = position.get("info") or {}
+                if pnl is None:
+                    pnl = self._safe_float(info.get("unRealizedProfit"))
+                if pnl is None:
+                    pnl = self._safe_float(info.get("unrealizedProfit"))
+                if pnl is None:
+                    pnl = 0.0
+                entry = self._safe_float(position.get("entryPrice"))
+                if entry is None:
+                    entry = self._safe_float((position.get("info") or {}).get("entryPrice"))
+                if entry is None:
+                    entry = self._safe_float(info.get("entryPrice"))
 
                 # 判断是否为多头或空头
                 if side == 'long':  # 多头
                     long_position = amount
+                    snap["long"]["amt"] = max(0.0, float(amount))
+                    snap["long"]["pnl"] = float(pnl)
+                    snap["long"]["entry_price"] = entry
                 elif side == 'short':  # 空头
                     short_position = amount  # 使用绝对值来计算空头合约数
+                    snap["short"]["amt"] = max(0.0, float(amount))
+                    snap["short"]["pnl"] = float(pnl)
+                    snap["short"]["entry_price"] = entry
+
+        try:
+            self._position_snapshot_cache = snap
+            self._position_snapshot_cache_ts = time.time()
+        except Exception:
+            pass
 
         # 如果没有持仓，返回 0
         if long_position == 0 and short_position == 0:
