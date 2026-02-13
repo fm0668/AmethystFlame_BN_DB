@@ -345,6 +345,12 @@ class GridTradingBot:
         self._open_orders_cache_ts = 0.0
         self._position_snapshot_cache = None
         self._position_snapshot_cache_ts = 0.0
+        self._had_position_once_long = False
+        self._had_position_once_short = False
+        self._force_entry_requote_once_long = False
+        self._force_entry_requote_once_short = False
+        self._force_rebuild_grid_long = False
+        self._force_rebuild_grid_short = False
         self._orders_dirty = True
         self._force_risk_eval_once = False
         self._open_orders_cache_sec = _safe_float(os.getenv("OPEN_ORDERS_CACHE_SEC", "10"), 10.0)
@@ -2951,18 +2957,26 @@ class GridTradingBot:
                     if reduce_only:
                         self.short_position = max(0.0, self.short_position - filled)
                         self.buy_short_orders = max(0.0, self.buy_short_orders - filled)
+                        if float(self.short_position or 0.0) <= 0:
+                            self._force_entry_requote_once_short = True
                     else:
                         self.buy_fills += 1
                         self.long_position += filled
                         self.buy_long_orders = max(0.0, self.buy_long_orders - filled)
+                        if float(self.long_position or 0.0) > 0:
+                            self._had_position_once_long = True
                 elif side == "SELL":
                     if reduce_only:
                         self.long_position = max(0.0, self.long_position - filled)
                         self.sell_long_orders = max(0.0, self.sell_long_orders - filled)
+                        if float(self.long_position or 0.0) <= 0:
+                            self._force_entry_requote_once_long = True
                     else:
                         self.sell_fills += 1
                         self.short_position += filled
                         self.sell_short_orders = max(0.0, self.sell_short_orders - filled)
+                        if float(self.short_position or 0.0) > 0:
+                            self._had_position_once_short = True
             elif status == "CANCELED":
                 if side == "BUY":
                     if reduce_only:
@@ -3038,6 +3052,11 @@ class GridTradingBot:
                 filled_side = "long" if str(anchor_ps) == "LONG" else "short"
                 self._set_grid_action_bypass(filled_side, window_sec=2.0)
                 self._force_orders_resync = True
+                if not _is_stop_like_ws_order(order):
+                    if filled_side == "long":
+                        self._force_rebuild_grid_long = True
+                    else:
+                        self._force_rebuild_grid_short = True
 
             if status in {"FILLED", "PARTIALLY_FILLED", "EXPIRED"}:
                 if status == "PARTIALLY_FILLED":
@@ -3626,6 +3645,13 @@ class GridTradingBot:
 
         pos = float(self.long_position or 0.0) if active_side == "long" else float(self.short_position or 0.0)
         if pos <= 0:
+            try:
+                had = bool(getattr(self, "_had_position_once_long", False)) if active_side == "long" else bool(getattr(self, "_had_position_once_short", False))
+            except Exception:
+                had = False
+            if had:
+                return False
+        if pos <= 0:
             if self._rest_allowed():
                 try:
                     lp, sp = self.get_position()
@@ -4027,12 +4053,32 @@ class GridTradingBot:
                     if (now - float(base_ts)) >= float(first_wait or 0.0):
                         refresh_initial = True
 
+                rebuild = False
+                try:
+                    if side == "long":
+                        rebuild = bool(getattr(self, "_force_rebuild_grid_long", False))
+                    else:
+                        rebuild = bool(getattr(self, "_force_rebuild_grid_short", False))
+                except Exception:
+                    rebuild = False
+
+                if pos <= 0:
+                    try:
+                        if side == "long" and bool(getattr(self, "_force_entry_requote_once_long", False)):
+                            refresh_initial = True
+                            self._force_entry_requote_once_long = False
+                        if side == "short" and bool(getattr(self, "_force_entry_requote_once_short", False)):
+                            refresh_initial = True
+                            self._force_entry_requote_once_short = False
+                    except Exception:
+                        pass
+
                 if pos > 0:
                     force_requote = bool(getattr(self, "_force_orders_resync", False))
                     add_dupe = int(add_count or 0) > 1
                     tp_dupe = int(tp_count or 0) > 1
-                    need_update_add = force_requote or (not add_present) or add_dupe
-                    need_update_tp = force_requote or (need_tp and ((not tp_present) or tp_dupe))
+                    need_update_add = rebuild or force_requote or (not add_present) or add_dupe
+                    need_update_tp = rebuild or force_requote or (need_tp and ((not tp_present) or tp_dupe))
                 else:
                     need_reset = (
                         bool(getattr(self, "_force_orders_resync", False))
@@ -4065,9 +4111,19 @@ class GridTradingBot:
                         elif str(side) == "short":
                             self._grid_action_bypass_until_short = 0.0
 
+                    if pos > 0 and rebuild:
+                        try:
+                            if side == "long":
+                                self._force_rebuild_grid_long = False
+                            else:
+                                self._force_rebuild_grid_short = False
+                        except Exception:
+                            pass
+
                     if pos <= 0 and refresh_initial:
                         logger.info(f"刷新 {side} 初始开仓挂单到最优价")
 
+                    rebuild_cancelled = False
                     if add_qty is not None and float(add_qty) > 0:
                         o = None
                         if pos <= 0:
@@ -4086,7 +4142,11 @@ class GridTradingBot:
                         if add_price is not None:
                             try:
                                 if pos > 0:
-                                    self.cancel_grid_orders_for_side(side, cancel_add=True, cancel_tp=False)
+                                    if rebuild and (not rebuild_cancelled):
+                                        self.cancel_grid_orders_for_side(side, cancel_add=True, cancel_tp=True)
+                                        rebuild_cancelled = True
+                                    else:
+                                        self.cancel_grid_orders_for_side(side, cancel_add=True, cancel_tp=False)
                                 else:
                                     self.cancel_orders_for_side(side)
                             except Exception:
@@ -4111,7 +4171,11 @@ class GridTradingBot:
                         tp_side = "sell" if side == "long" else "buy"
                         if bool(need_update_tp):
                             try:
-                                self.cancel_grid_orders_for_side(side, cancel_add=False, cancel_tp=True)
+                                if rebuild and (not rebuild_cancelled):
+                                    self.cancel_grid_orders_for_side(side, cancel_add=True, cancel_tp=True)
+                                    rebuild_cancelled = True
+                                else:
+                                    self.cancel_grid_orders_for_side(side, cancel_add=False, cancel_tp=True)
                             except Exception:
                                 pass
                             self.place_order(
