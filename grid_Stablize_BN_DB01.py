@@ -3402,6 +3402,27 @@ class GridTradingBot:
                     raise e
 
         except ccxt.BaseError as e:
+            msg = str(e)
+            msg2 = msg.lower()
+            if ("-4116" in msg2) or ("clientorderid is duplicated" in msg2) or ("clientorderid is duplicated" in msg2.replace(" ", "")):
+                try:
+                    self._orders_dirty = True
+                except Exception:
+                    pass
+                try:
+                    ps2 = str(position_side or "").strip().lower()
+                    if ps2 in {"long", "short"}:
+                        self._mark_grid_action(ps2)
+                except Exception:
+                    pass
+                try:
+                    if self._rest_allowed():
+                        self._refresh_open_orders_cache()
+                except Exception:
+                    pass
+                if self._err_rate_limit("dup_client_order_id", 10.0):
+                    self._set_last_error(f"交易所返回 ClientOrderId 重复(-4116)，已刷新订单快照并降频重试：{e}")
+                return {"id": "duplicate_client_order_id", "info": {"error": msg}}
             self._note_rest_error_if_needed(e, "place_order")
             logger.error(f"下单报错: {e}")
             return None
