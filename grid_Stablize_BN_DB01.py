@@ -3928,6 +3928,8 @@ class GridTradingBot:
 
                 add_present = False
                 tp_present = False
+                add_count = 0
+                tp_count = 0
                 add_order_ts = None
                 add_ok = False
                 tp_ok = False
@@ -3971,6 +3973,7 @@ class GridTradingBot:
                     if side == "long":
                         if (not ro) and o_side == add_side:
                             add_present = True
+                            add_count += 1
                             add_order_ts = self._get_order_timestamp_sec(o) or add_order_ts
                             if desired_add_id is not None and (o_cid is None or str(o_cid or "") == desired_add_id):
                                 add_id_ok = True
@@ -3979,12 +3982,14 @@ class GridTradingBot:
                                     add_ok = True
                         if ro and o_side == tp_side:
                             tp_present = True
+                            tp_count += 1
                             if o_price == tp_price_target:
                                 if desired_tp_id is None or o_cid is None or str(o_cid or "") == desired_tp_id:
                                     tp_ok = True
                     else:
                         if (not ro) and o_side == add_side:
                             add_present = True
+                            add_count += 1
                             add_order_ts = self._get_order_timestamp_sec(o) or add_order_ts
                             if desired_add_id is not None and (o_cid is None or str(o_cid or "") == desired_add_id):
                                 add_id_ok = True
@@ -3993,6 +3998,7 @@ class GridTradingBot:
                                     add_ok = True
                         if ro and o_side == tp_side:
                             tp_present = True
+                            tp_count += 1
                             if o_price == tp_price_target:
                                 if desired_tp_id is None or o_cid is None or str(o_cid or "") == desired_tp_id:
                                     tp_ok = True
@@ -4022,8 +4028,11 @@ class GridTradingBot:
                         refresh_initial = True
 
                 if pos > 0:
-                    need_update_add = bool(getattr(self, "_force_orders_resync", False)) or (not add_ok)
-                    need_update_tp = bool(getattr(self, "_force_orders_resync", False)) or (not tp_ok)
+                    force_requote = bool(getattr(self, "_force_orders_resync", False))
+                    add_dupe = int(add_count or 0) > 1
+                    tp_dupe = int(tp_count or 0) > 1
+                    need_update_add = force_requote or (not add_present) or add_dupe
+                    need_update_tp = force_requote or (need_tp and ((not tp_present) or tp_dupe))
                 else:
                     need_reset = (
                         bool(getattr(self, "_force_orders_resync", False))
