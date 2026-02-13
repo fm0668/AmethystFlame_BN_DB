@@ -2953,30 +2953,31 @@ class GridTradingBot:
                         self.sell_short_orders += remaining
             elif status == "FILLED":
                 self.total_fills += 1
-                if side == "BUY":
-                    if reduce_only:
-                        self.short_position = max(0.0, self.short_position - filled)
-                        self.buy_short_orders = max(0.0, self.buy_short_orders - filled)
-                        if float(self.short_position or 0.0) <= 0:
-                            self._force_entry_requote_once_short = True
-                    else:
-                        self.buy_fills += 1
-                        self.long_position += filled
-                        self.buy_long_orders = max(0.0, self.buy_long_orders - filled)
-                        if float(self.long_position or 0.0) > 0:
-                            self._had_position_once_long = True
-                elif side == "SELL":
-                    if reduce_only:
-                        self.long_position = max(0.0, self.long_position - filled)
-                        self.sell_long_orders = max(0.0, self.sell_long_orders - filled)
-                        if float(self.long_position or 0.0) <= 0:
-                            self._force_entry_requote_once_long = True
-                    else:
-                        self.sell_fills += 1
-                        self.short_position += filled
-                        self.sell_short_orders = max(0.0, self.sell_short_orders - filled)
-                        if float(self.short_position or 0.0) > 0:
-                            self._had_position_once_short = True
+                if exec_type != "TRADE":
+                    if side == "BUY":
+                        if reduce_only:
+                            self.short_position = max(0.0, self.short_position - filled)
+                            self.buy_short_orders = max(0.0, self.buy_short_orders - filled)
+                            if float(self.short_position or 0.0) <= 0:
+                                self._force_entry_requote_once_short = True
+                        else:
+                            self.buy_fills += 1
+                            self.long_position += filled
+                            self.buy_long_orders = max(0.0, self.buy_long_orders - filled)
+                            if float(self.long_position or 0.0) > 0:
+                                self._had_position_once_long = True
+                    elif side == "SELL":
+                        if reduce_only:
+                            self.long_position = max(0.0, self.long_position - filled)
+                            self.sell_long_orders = max(0.0, self.sell_long_orders - filled)
+                            if float(self.long_position or 0.0) <= 0:
+                                self._force_entry_requote_once_long = True
+                        else:
+                            self.sell_fills += 1
+                            self.short_position += filled
+                            self.sell_short_orders = max(0.0, self.sell_short_orders - filled)
+                            if float(self.short_position or 0.0) > 0:
+                                self._had_position_once_short = True
             elif status == "CANCELED":
                 if side == "BUY":
                     if reduce_only:
@@ -3888,7 +3889,17 @@ class GridTradingBot:
             active_side = str(self.direction or "long").strip().lower()
             if active_side not in {"long", "short"}:
                 active_side = "long"
-            active_sides = (active_side,)
+            sides_with_pos = []
+            if float(long_pos) > 0:
+                sides_with_pos.append("long")
+            if float(short_pos) > 0:
+                sides_with_pos.append("short")
+            if sides_with_pos:
+                active_sides = tuple(sides_with_pos)
+                if active_side not in sides_with_pos:
+                    self._set_last_error(f"检测到现有持仓方向={active_sides} 与配置方向={active_side} 不一致，已按持仓方向管理网格挂单")
+            else:
+                active_sides = (active_side,)
 
             plans = {}
             for s in active_sides:
