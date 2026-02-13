@@ -3025,6 +3025,62 @@ class GridTradingBot:
                         self._last_trade_id_seen.add(trade_sig)
                         if len(self._last_trade_id_seen) > int(self._last_trade_id_seen_max):
                             self._last_trade_id_seen = set(list(self._last_trade_id_seen)[-int(self._last_trade_id_seen_max):])
+
+                    delta_qty = self._safe_float(order.get("l"))
+                    if delta_qty is None:
+                        delta_qty = self._safe_float(order.get("lastFilledQty"))
+                    if delta_qty is None:
+                        delta_qty = self._safe_float(order.get("last_qty"))
+                    if delta_qty is None:
+                        delta_qty = 0.0
+                    try:
+                        delta_qty = float(delta_qty)
+                    except Exception:
+                        delta_qty = 0.0
+                    if delta_qty <= 0:
+                        if status == "FILLED":
+                            delta_qty = float(filled or 0.0)
+                        else:
+                            delta_qty = 0.0
+
+                    if delta_qty > 0:
+                        if side == "BUY":
+                            if reduce_only:
+                                self.short_position = max(0.0, float(self.short_position or 0.0) - float(delta_qty))
+                                self.buy_short_orders = max(0.0, float(self.buy_short_orders or 0.0) - float(delta_qty))
+                                if float(self.short_position or 0.0) <= 0:
+                                    self._force_entry_requote_once_short = True
+                            else:
+                                self.long_position = float(self.long_position or 0.0) + float(delta_qty)
+                                self.buy_long_orders = max(0.0, float(self.buy_long_orders or 0.0) - float(delta_qty))
+                                if float(self.long_position or 0.0) > 0:
+                                    self._had_position_once_long = True
+                        elif side == "SELL":
+                            if reduce_only:
+                                self.long_position = max(0.0, float(self.long_position or 0.0) - float(delta_qty))
+                                self.sell_long_orders = max(0.0, float(self.sell_long_orders or 0.0) - float(delta_qty))
+                                if float(self.long_position or 0.0) <= 0:
+                                    self._force_entry_requote_once_long = True
+                            else:
+                                self.short_position = float(self.short_position or 0.0) + float(delta_qty)
+                                self.sell_short_orders = max(0.0, float(self.sell_short_orders or 0.0) - float(delta_qty))
+                                if float(self.short_position or 0.0) > 0:
+                                    self._had_position_once_short = True
+
+                        impacted = None
+                        if side == "BUY":
+                            impacted = "short" if reduce_only else "long"
+                        elif side == "SELL":
+                            impacted = "long" if reduce_only else "short"
+                        if impacted in {"long", "short"}:
+                            self._set_grid_action_bypass(impacted, window_sec=2.0)
+                            self._force_orders_resync = True
+                            if not _is_stop_like_ws_order(order):
+                                if impacted == "long":
+                                    self._force_rebuild_grid_long = True
+                                else:
+                                    self._force_rebuild_grid_short = True
+
                     rp = self._safe_float(order.get("rp"))
                     if rp is not None:
                         self.instance_realized_pnl += float(rp)
