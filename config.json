@@ -23,6 +23,9 @@
   },
   "同步": {
     "状态同步间隔秒": 10,
+    "OPEN_ORDERS_CACHE_SEC": 20,
+    "POSITION_SYNC_INTERVAL_SEC": 60,
+    "ORDERS_SYNC_INTERVAL_SEC": 60,
     "最小重挂间隔秒": 10,
     "状态日志间隔秒": 60
   },

@@ -32,6 +32,9 @@ class RiskEngine:
             "BASE_GRID_SPACING": 0.0025,
             "BASE_ORDER_SIZE_USDC": 40.0,
             "REST_SYNC_INTERVAL_SEC": 10.0,
+            "OPEN_ORDERS_CACHE_SEC": 10.0,
+            "POSITION_SYNC_INTERVAL_SEC": 60.0,
+            "ORDERS_SYNC_INTERVAL_SEC": 60.0,
             "ORDER_FIRST_TIME_SEC": 10.0,
             "GRID_ACTION_COOLDOWN_SEC": 1.2,
             "TP_MAKER_ONLY": False,
@@ -151,6 +154,12 @@ class RiskEngine:
                 out["GRID_ACTION_COOLDOWN_SEC"] = sync.get("最小重挂间隔秒")
             if "状态日志间隔秒" in sync:
                 out["STATUS_LOG_INTERVAL_SEC"] = sync.get("状态日志间隔秒")
+            if "OPEN_ORDERS_CACHE_SEC" in sync:
+                out["OPEN_ORDERS_CACHE_SEC"] = sync.get("OPEN_ORDERS_CACHE_SEC")
+            if "POSITION_SYNC_INTERVAL_SEC" in sync:
+                out["POSITION_SYNC_INTERVAL_SEC"] = sync.get("POSITION_SYNC_INTERVAL_SEC")
+            if "ORDERS_SYNC_INTERVAL_SEC" in sync:
+                out["ORDERS_SYNC_INTERVAL_SEC"] = sync.get("ORDERS_SYNC_INTERVAL_SEC")
 
         hot = raw.get("热加载")
         if isinstance(hot, dict):

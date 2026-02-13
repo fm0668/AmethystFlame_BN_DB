@@ -343,6 +343,17 @@ class GridTradingBot:
         self._ws = None
         self._open_orders_cache = None
         self._open_orders_cache_ts = 0.0
+        self._orders_dirty = True
+        self._force_risk_eval_once = False
+        self._open_orders_cache_sec = _safe_float(os.getenv("OPEN_ORDERS_CACHE_SEC", "10"), 10.0)
+        if self._open_orders_cache_sec <= 0:
+            self._open_orders_cache_sec = 10.0
+        self._position_sync_interval_sec = _safe_float(os.getenv("POSITION_SYNC_INTERVAL_SEC", "60"), 60.0)
+        if self._position_sync_interval_sec <= 0:
+            self._position_sync_interval_sec = 60.0
+        self._orders_sync_interval_sec = _safe_float(os.getenv("ORDERS_SYNC_INTERVAL_SEC", "60"), 60.0)
+        if self._orders_sync_interval_sec <= 0:
+            self._orders_sync_interval_sec = 60.0
         self._last_long_grid_action_ts = 0.0
         self._last_short_grid_action_ts = 0.0
         self._grid_action_cooldown_sec = 1.2
@@ -595,6 +606,30 @@ class GridTradingBot:
             self._status_log_interval_sec = float(itv)
 
         try:
+            oc = float(cfg.get("OPEN_ORDERS_CACHE_SEC", getattr(self, "_open_orders_cache_sec", 10.0)) or 10.0)
+        except Exception:
+            oc = getattr(self, "_open_orders_cache_sec", 10.0)
+        if oc <= 0:
+            oc = 10.0
+        self._open_orders_cache_sec = float(oc)
+
+        try:
+            ps = float(cfg.get("POSITION_SYNC_INTERVAL_SEC", getattr(self, "_position_sync_interval_sec", 60.0)) or 60.0)
+        except Exception:
+            ps = getattr(self, "_position_sync_interval_sec", 60.0)
+        if ps <= 0:
+            ps = 60.0
+        self._position_sync_interval_sec = float(ps)
+
+        try:
+            os_itv = float(cfg.get("ORDERS_SYNC_INTERVAL_SEC", getattr(self, "_orders_sync_interval_sec", 60.0)) or 60.0)
+        except Exception:
+            os_itv = getattr(self, "_orders_sync_interval_sec", 60.0)
+        if os_itv <= 0:
+            os_itv = 60.0
+        self._orders_sync_interval_sec = float(os_itv)
+
+        try:
             self._apply_leverage_from_config()
         except Exception:
             pass
@@ -791,6 +826,25 @@ class GridTradingBot:
         if ms <= 0:
             return 0.0
         return float(ms) / 1000.0
+
+    def _is_rate_limit_error(self, err) -> bool:
+        s = str(err or "")
+        s2 = s.lower()
+        if "banned until" in s2:
+            return True
+        if "too many requests" in s2:
+            return True
+        if "ddosprotection" in s2:
+            return True
+        if "418" in s2 and "teapot" in s2:
+            return True
+        if "-1003" in s2:
+            return True
+        return False
+
+    def _note_rest_error_if_needed(self, err, label: str = "rest") -> None:
+        if self._is_rate_limit_error(err):
+            self._note_rest_error(err, label)
 
     def _rest_allowed(self) -> bool:
         now = time.time()
@@ -1017,10 +1071,16 @@ class GridTradingBot:
             if cached is not None:
                 return cached
             return []
-        orders = self.exchange.fetch_open_orders(self.ccxt_symbol)
-        self._open_orders_cache = orders
-        self._open_orders_cache_ts = now
-        return orders
+        try:
+            orders = self.exchange.fetch_open_orders(self.ccxt_symbol)
+            self._open_orders_cache = orders
+            self._open_orders_cache_ts = now
+            return orders
+        except Exception as e:
+            self._note_rest_error_if_needed(e, "open_orders")
+            if cached is not None:
+                return cached
+            return []
 
     def _refresh_open_orders_cache(self):
         if not self._rest_allowed():
@@ -1030,9 +1090,31 @@ class GridTradingBot:
             orders = self.exchange.fetch_open_orders(self.ccxt_symbol)
             self._open_orders_cache = orders
             self._open_orders_cache_ts = time.time()
-        except Exception:
-            self._open_orders_cache = None
+            self._orders_dirty = False
+        except Exception as e:
+            self._note_rest_error_if_needed(e, "open_orders_refresh")
             self._open_orders_cache_ts = time.time()
+
+    def _get_open_orders_for_eval(self, cfg: dict):
+        ttl = None
+        try:
+            ttl = float(getattr(self, "_open_orders_cache_sec", None))
+        except Exception:
+            ttl = None
+        if ttl is None or ttl <= 0:
+            ttl = float(self.rest_sync_interval_sec or 10.0)
+        ttl = max(0.5, float(ttl))
+
+        if bool(getattr(self, "_orders_dirty", False)) and self._rest_allowed():
+            try:
+                orders = self.exchange.fetch_open_orders(self.ccxt_symbol)
+                self._open_orders_cache = orders
+                self._open_orders_cache_ts = time.time()
+                self._orders_dirty = False
+                return orders
+            except Exception as e:
+                self._note_rest_error(e, "open_orders_event_refresh")
+        return self._get_open_orders_cached(max_age_sec=float(ttl))
 
     def _get_order_position_side(self, order: dict):
         info = (order or {}).get("info") or {}
@@ -1240,7 +1322,11 @@ class GridTradingBot:
 
     def get_dynamic_equity(self):
         """获取当前账户动态权益 (余额 + 未实现盈亏)"""
-        balance = self.exchange.fetch_balance(params={"type": "future"})
+        try:
+            balance = self.exchange.fetch_balance(params={"type": "future"})
+        except Exception as e:
+            self._note_rest_error(e, "balance")
+            raise
         info = balance.get("info") or {}
 
         equity = self._extract_equity_from_balance_info(info)
@@ -1418,7 +1504,11 @@ class GridTradingBot:
 
     def get_position_snapshot(self):
         params = {"type": "future"}
-        positions = self.exchange.fetch_positions(params=params)
+        try:
+            positions = self.exchange.fetch_positions(params=params)
+        except Exception as e:
+            self._note_rest_error(e, "pos_snapshot")
+            raise
         out = {
             "long": {"amt": 0.0, "pnl": 0.0, "entry_price": None},
             "short": {"amt": 0.0, "pnl": 0.0, "entry_price": None},
@@ -2409,7 +2499,11 @@ class GridTradingBot:
         params = {
             'type': 'future'  # 永续合约
         }
-        positions = self.exchange.fetch_positions(params=params)
+        try:
+            positions = self.exchange.fetch_positions(params=params)
+        except Exception as e:
+            self._note_rest_error(e, "pos")
+            raise
         # print(positions)
         long_position = 0
         short_position = 0
@@ -2472,7 +2566,11 @@ class GridTradingBot:
     def check_orders_status(self):
         """检查当前所有挂单的状态，并更新多头和空头的挂单数量"""
         # 获取当前所有挂单（带 symbol 参数，限制为某个交易对）
-        orders = self.exchange.fetch_open_orders(symbol=self.ccxt_symbol)
+        try:
+            orders = self.exchange.fetch_open_orders(symbol=self.ccxt_symbol)
+        except Exception as e:
+            self._note_rest_error(e, "orders_status")
+            raise
 
         # 初始化计数器
         buy_long_orders = 0.0  # 使用浮点数
@@ -2567,7 +2665,11 @@ class GridTradingBot:
         self._apply_runtime_settings_from_config()
         asyncio.create_task(self.status_file_loop())
         # 初始化时获取一次持仓数据
-        self.long_position, self.short_position = self.get_position()
+        try:
+            self.long_position, self.short_position = self.get_position()
+        except Exception as e:
+            self._note_rest_error_if_needed(e, "init_pos")
+            self.long_position, self.short_position = 0.0, 0.0
         # self.last_position_update_time = time.time()
         logger.info(f"初始化持仓: 多头 {self.long_position} 张, 空头 {self.short_position} 张")
 
@@ -2575,7 +2677,14 @@ class GridTradingBot:
         await asyncio.sleep(float(self.order_first_time_sec or 0.0))
 
         # 初始化时获取一次挂单状态
-        self.check_orders_status()
+        try:
+            self.check_orders_status()
+        except Exception as e:
+            self._note_rest_error_if_needed(e, "init_orders")
+            self.buy_long_orders = 0.0
+            self.sell_long_orders = 0.0
+            self.sell_short_orders = 0.0
+            self.buy_short_orders = 0.0
         logger.info(
             f"初始化挂单状态: 多头开仓={self.buy_long_orders}, 多头止盈={self.sell_long_orders}, 空头开仓={self.sell_short_orders}, 空头止盈={self.buy_short_orders}")
 
@@ -2720,7 +2829,7 @@ class GridTradingBot:
                 logger.error(f"解析价格失败: {e}")
 
             # 检查持仓状态是否过时
-            if time.time() - self.last_position_update_time > float(self.rest_sync_interval_sec or 0.0):
+            if time.time() - self.last_position_update_time > float(getattr(self, "_position_sync_interval_sec", self.rest_sync_interval_sec) or 0.0):
                 if self._rest_allowed():
                     try:
                         self.long_position, self.short_position = self.get_position()
@@ -2732,7 +2841,7 @@ class GridTradingBot:
                         self._note_rest_error(e, "pos_sync")
 
             # 检查持仓状态是否过时
-            if time.time() - self.last_orders_update_time > float(self.rest_sync_interval_sec or 0.0):
+            if time.time() - self.last_orders_update_time > float(getattr(self, "_orders_sync_interval_sec", self.rest_sync_interval_sec) or 0.0):
                 if self._rest_allowed():
                     try:
                         self.check_orders_status()
@@ -2841,6 +2950,9 @@ class GridTradingBot:
             except Exception:
                 pass
 
+            if status in {"NEW", "FILLED", "PARTIALLY_FILLED", "CANCELED", "EXPIRED"}:
+                self._orders_dirty = True
+
             if reduce_only and _is_stop_like_ws_order(order):
                 r = _stop_reason_from_ws_order(order) or "hard_stoploss"
                 closed_side = "short" if side == "BUY" else "long"
@@ -2924,6 +3036,7 @@ class GridTradingBot:
             return
 
         if need_eval:
+            self._force_risk_eval_once = True
             self._kick_risk_eval()
 
     async def _maybe_shutdown_after_algo_event(self, closed_side: str, reason: str):
@@ -3005,6 +3118,7 @@ class GridTradingBot:
             return
         if self.shutdown_event.is_set():
             return
+        self._force_risk_eval_once = True
         self._order_event_eval_task = asyncio.create_task(self._order_event_eval())
 
     async def _order_event_eval(self):
@@ -3168,14 +3282,20 @@ class GridTradingBot:
     def cancel_order(self, order_id):
         """撤单"""
         try:
+            if not self._rest_allowed():
+                return
             self.exchange.cancel_order(order_id, self.ccxt_symbol)
+            self._orders_dirty = True
             # logger.info(f"撤销挂单成功, 订单ID: {order_id}")
         except ccxt.BaseError as e:
+            self._note_rest_error_if_needed(e, "cancel_order")
             logger.error(f"撤单失败: {e}")
 
     def place_order(self, side, price, quantity, is_reduce_only=False, position_side=None, order_type='limit', client_order_id=None):
         """挂单函数，增加双向持仓支持"""
         try:
+            if not self._rest_allowed():
+                return None
             if quantity is None:
                 return None
             price = round(price, self.price_precision) if price is not None else None
@@ -3198,6 +3318,7 @@ class GridTradingBot:
                 if bool(getattr(self, "_hedge_mode", False)) and position_side is not None:
                     params['positionSide'] = str(position_side).strip().upper()
                 order = self.exchange.create_order(self.ccxt_symbol, 'market', side, quantity, None, params)
+                self._orders_dirty = True
                 return order
             else:
                 # 检查 price 是否为 None
@@ -3258,6 +3379,7 @@ class GridTradingBot:
                     params["timeInForce"] = "GTX"
                 try:
                     order = self.exchange.create_order(self.ccxt_symbol, 'limit', side, quantity, price, params)
+                    self._orders_dirty = True
                     return order
                 except ccxt.BaseError as e:
                     if maker_only_limit or maker_only_tp:
@@ -3280,6 +3402,7 @@ class GridTradingBot:
                     raise e
 
         except ccxt.BaseError as e:
+            self._note_rest_error_if_needed(e, "place_order")
             logger.error(f"下单报错: {e}")
             return None
 
@@ -3574,7 +3697,10 @@ class GridTradingBot:
         maker_only = self._maker_only_enabled()
         min_interval = float(cfg.get("RISK_EVAL_MIN_INTERVAL_SEC", 0.8))
         now = time.time()
-        if min_interval > 0 and (now - float(getattr(self, "_last_risk_eval_ts", 0.0) or 0.0)) < min_interval:
+        force_once = bool(getattr(self, "_force_risk_eval_once", False))
+        if force_once:
+            self._force_risk_eval_once = False
+        if (not force_once) and min_interval > 0 and (now - float(getattr(self, "_last_risk_eval_ts", 0.0) or 0.0)) < min_interval:
             return
         self._last_risk_eval_ts = now
 
@@ -3605,7 +3731,7 @@ class GridTradingBot:
             self._grid_disabled_purged = False
 
             try:
-                orders = self._get_open_orders_cached(max_age_sec=0.5) or []
+                orders = self._get_open_orders_for_eval(cfg) or []
             except Exception:
                 orders = []
 
